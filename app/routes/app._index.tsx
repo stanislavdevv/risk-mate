@@ -1,9 +1,10 @@
 // app/routes/app._index.tsx
 import type { LoaderFunctionArgs, ActionFunctionArgs } from "react-router";
-import { Form, useFetcher, useLoaderData, useSearchParams } from "react-router";
+import { useFetcher, useLoaderData, useSearchParams } from "react-router";
 import { useEffect, useMemo, useRef, useState } from "react";
 import prisma from "../db.server";
 import { authenticate } from "../shopify.server";
+import { SUPPORTED_LANGS, type Lang, t, parseLang } from "../i18n/strings";
 
 /* ---------- types ---------- */
 
@@ -31,7 +32,6 @@ type RiskEventRow = {
   skipReason: string | null;
 };
 
-
 type Row = {
   id: string;
   orderGid: string;
@@ -43,7 +43,7 @@ type Row = {
   updatedAt: string;
   orderAdminUrl: string | null;
 
-  // ✅ trust
+  // trust
   lastTopic: string | null;
   lastEventAt: string | null;
   eventCount: number;
@@ -68,10 +68,11 @@ export async function loader({ request }: LoaderFunctionArgs) {
   const { session, admin } = await authenticate.admin(request);
   const url = new URL(request.url);
 
+  const lang = parseLang(url.searchParams.get("lang"));
+
   const shopRes = await admin.graphql(`
     query { shop { currencyCode } }
   `);
-
   const shopJson = await shopRes.json();
   const currency = shopJson?.data?.shop?.currencyCode ?? "UNKNOWN";
 
@@ -92,12 +93,17 @@ export async function loader({ request }: LoaderFunctionArgs) {
     take: 50,
   });
 
-  const events = await prisma.riskEvent.findMany({
-    where: { shop: session.shop },
-    orderBy: { createdAt: "desc" },
-    take: 20,
-  });
-
+  // optional: recent events section (if model exists)
+  let events: any[] = [];
+  try {
+    events = await prisma.riskEvent.findMany({
+      where: { shop: session.shop },
+      orderBy: { createdAt: "desc" },
+      take: 20,
+    });
+  } catch {
+    events = [];
+  }
 
   const hasRules = rules.length > 0;
   const hasChecks = items.length > 0;
@@ -107,6 +113,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
     currency,
     tab,
     level,
+    lang,
     hasRules,
     hasChecks,
     rules: rules.map(
@@ -121,15 +128,17 @@ export async function loader({ request }: LoaderFunctionArgs) {
         createdAt: r.createdAt.toISOString(),
       }),
     ),
-    events: events.map((e) => ({
-      id: e.id,
-      orderGid: e.orderGid,
-      orderName: e.orderName,
-      topic: e.topic,
-      eventAt: e.eventAt.toISOString(),
-      decision: e.decision ?? null,
-      skipReason: e.skipReason ?? null,
-    })),
+    events: events.map(
+      (e): RiskEventRow => ({
+        id: e.id,
+        orderGid: e.orderGid,
+        orderName: e.orderName,
+        topic: e.topic,
+        eventAt: e.eventAt.toISOString(),
+        decision: e.decision ?? null,
+        skipReason: e.skipReason ?? null,
+      }),
+    ),
     rows: items.map(
       (it): Row => {
         const orderId = orderIdFromGid(it.orderGid);
@@ -146,7 +155,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
           updatedAt: it.updatedAt.toISOString(),
           orderAdminUrl,
 
-          // ✅ trust (field-safe during migration)
+          // trust (field-safe during migration)
           lastTopic: (it as any).lastTopic ?? null,
           lastEventAt: (it as any).lastEventAt ? (it as any).lastEventAt.toISOString() : null,
           eventCount: Number((it as any).eventCount ?? 0),
@@ -183,7 +192,7 @@ export async function action({ request }: ActionFunctionArgs) {
     return errors;
   };
 
-  // ✅ seed defaults (only if no rules)
+  // seed defaults (only if no rules)
   if (intent === "seedDefaultRules") {
     const existingCount = await prisma.riskRule.count({ where: { shop: session.shop } });
     if (existingCount > 0) {
@@ -198,20 +207,16 @@ export async function action({ request }: ActionFunctionArgs) {
       action: string | null;
       enabled: boolean;
     }> = [
-        // High value
-        { type: "ORDER_VALUE", operator: ">=", value: "300", points: 15, action: "REVIEW", enabled: true },
-        { type: "ORDER_VALUE", operator: ">=", value: "500", points: 25, action: "HOLD", enabled: true },
+      { type: "ORDER_VALUE", operator: ">=", value: "300", points: 15, action: "REVIEW", enabled: true },
+      { type: "ORDER_VALUE", operator: ">=", value: "500", points: 25, action: "HOLD", enabled: true },
 
-        // First time buyer
-        { type: "FIRST_TIME", operator: "=", value: "true", points: 10, action: "REVIEW", enabled: true },
+      { type: "FIRST_TIME", operator: "=", value: "true", points: 10, action: "REVIEW", enabled: true },
 
-        // High qty
-        { type: "HIGH_QTY", operator: ">=", value: "5", points: 10, action: "REVIEW", enabled: true },
-        { type: "HIGH_QTY", operator: ">=", value: "10", points: 20, action: "HOLD", enabled: true },
+      { type: "HIGH_QTY", operator: ">=", value: "5", points: 10, action: "REVIEW", enabled: true },
+      { type: "HIGH_QTY", operator: ">=", value: "10", points: 20, action: "HOLD", enabled: true },
 
-        // Country mismatch (engine interprets this)
-        { type: "COUNTRY_MISMATCH", operator: "=", value: "true", points: 15, action: "HOLD", enabled: true },
-      ];
+      { type: "COUNTRY_MISMATCH", operator: "=", value: "true", points: 15, action: "HOLD", enabled: true },
+    ];
 
     const created = await prisma.$transaction(
       defaults.map((d) =>
@@ -347,6 +352,8 @@ export default function AppIndex() {
   const data = useLoaderData() as LoaderData;
   const [params, setParams] = useSearchParams();
 
+  const lang = (params.get("lang") ? parseLang(params.get("lang")) : data.lang) as Lang;
+
   const tab = (params.get("tab") ?? "orders").toLowerCase();
   const level = (params.get("level") ?? "ALL").toUpperCase();
 
@@ -363,47 +370,116 @@ export default function AppIndex() {
     setParams(p);
   };
 
+  const setLang = (next: Lang) => {
+    const p = new URLSearchParams(params);
+    p.set("lang", next);
+    setParams(p);
+  };
+
   return (
     <div style={page}>
       <header style={header}>
         <div>
-          <div style={kicker}>RiskMate</div>
+          <div style={kicker}>{t(lang, "appName")}</div>
           <div style={subtle}>
-            {data.shop} · Store currency: <b>{data.currency}</b>
+            {data.shop} · {t(lang, "storeCurrency")}: <b>{data.currency}</b>
           </div>
+        </div>
+
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <select value={lang} onChange={(e) => setLang(e.target.value as Lang)} style={langSelect}>
+            {SUPPORTED_LANGS.map((l) => (
+              <option key={l} value={l}>
+                {l.toUpperCase()}
+              </option>
+            ))}
+          </select>
         </div>
       </header>
 
       <div style={tabsWrap}>
         <button type="button" onClick={() => setTab("orders")} style={tabBtn(tab === "orders")}>
-          Orders
+          {t(lang, "tabOrders")}
         </button>
         <button type="button" onClick={() => setTab("rules")} style={tabBtn(tab === "rules")}>
-          Rules
+          {t(lang, "tabRules")}
         </button>
       </div>
 
       {tab === "orders" ? (
         <>
-          <SetupChecklist hasRules={data.hasRules} hasChecks={data.hasChecks} shop={data.shop} />
+          <SetupChecklist lang={lang} hasRules={data.hasRules} hasChecks={data.hasChecks} shop={data.shop} />
+          <div style={{ height: 12 }} />
+
+          {/* Recent events */}
+          <section style={card}>
+            <div style={cardHeaderRow}>
+              <div>
+                <h2 style={h2}>{t(lang, "recentEventsTitle")}</h2>
+                <div style={subtle}>{t(lang, "recentEventsSubtitle")}</div>
+              </div>
+            </div>
+
+            <div style={divider} />
+
+            {!data.events || data.events.length === 0 ? (
+              <EmptyState title={t(lang, "noChecksYetTitle")}>{t(lang, "noEventsYet")}</EmptyState>
+            ) : (
+              <div style={{ overflowX: "auto" }}>
+                <table style={tableOrders}>
+                  <thead>
+                    <tr>
+                      <th style={th}>{t(lang, "evTime")}</th>
+                      <th style={th}>{t(lang, "evTopic")}</th>
+                      <th style={th}>{t(lang, "evOrder")}</th>
+                      <th style={th}>{t(lang, "evDecision")}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {data.events.map((e) => (
+                      <tr key={e.id}>
+                        <td style={td}>{formatDate(e.eventAt)}</td>
+                        <td style={td}>
+                          <code style={codeInline}>{e.topic}</code>
+                        </td>
+                        <td style={tdStrong}>
+                          {e.orderName || "—"}
+                          <div style={{ marginTop: 4, fontSize: 12, color: "#6d7175" }}>
+                            <code style={codeInline}>{shortGid(e.orderGid)}</code>
+                          </div>
+                        </td>
+                        <td style={td}>
+                          <code style={codeInline}>
+                            {e.decision ?? "—"}
+                            {e.skipReason ? ` (${e.skipReason})` : ""}
+                          </code>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </section>
+
           <div style={{ height: 12 }} />
 
           <section style={card}>
             <div style={cardHeaderRow}>
-              <h2 style={h2}>Orders</h2>
+              <h2 style={h2}>{t(lang, "ordersTitle")}</h2>
 
               <div style={{ display: "flex", gap: 8 }}>
                 <button onClick={() => setLevel("ALL")} style={pillBtn(level === "ALL")}>
-                  All
+                  {t(lang, "all")}
                 </button>
                 <button onClick={() => setLevel("HIGH")} style={pillBtn(level === "HIGH")}>
-                  High
+                  {t(lang, "high")}
                 </button>
                 <button onClick={() => setLevel("MEDIUM")} style={pillBtn(level === "MEDIUM")}>
-                  Medium
+                  {t(lang, "medium")}
                 </button>
                 <button onClick={() => setLevel("LOW")} style={pillBtn(level === "LOW")}>
-                  Low
+                  {t(lang, "low")}
                 </button>
               </div>
             </div>
@@ -411,52 +487,47 @@ export default function AppIndex() {
             <div style={divider} />
 
             {data.rows.length === 0 ? (
-              <EmptyState>No checks yet. Create or update a test order to trigger webhooks.</EmptyState>
+              <EmptyState title={t(lang, "noChecksYetTitle")}>{t(lang, "noChecksYetText")}</EmptyState>
             ) : (
               <div style={{ overflowX: "auto" }}>
                 <table style={tableOrders}>
                   <thead>
                     <tr>
-                      <th style={th}>Last event</th>
-                      <th style={th}>Order</th>
-                      <th style={th}>Score</th>
-                      <th style={th}>Risk</th>
-                      <th style={th}>Top reasons</th>
-                      <th style={th}>Link</th>
+                      <th style={th}>{t(lang, "thLastEvent")}</th>
+                      <th style={th}>{t(lang, "thUpdated")}</th>
+                      <th style={th}>{t(lang, "thOrder")}</th>
+                      <th style={th}>{t(lang, "thScore")}</th>
+                      <th style={th}>{t(lang, "thRisk")}</th>
+                      <th style={th}>{t(lang, "thTopReasons")}</th>
+                      <th style={th}>{t(lang, "thLink")}</th>
                     </tr>
                   </thead>
 
                   <tbody>
                     {data.rows.map((r) => (
                       <tr key={r.id}>
-                        {/* Last event */}
                         <td style={td}>
-                          {/* line 1: last event */}
                           <div>{formatDate(r.lastEventAt ?? r.updatedAt)}</div>
-
-                          {/* line 2: topic + count */}
                           <div style={{ marginTop: 4, fontSize: 12, color: "#6d7175" }}>
                             <code style={codeInline}>{r.lastTopic ?? "—"}</code>
                             <span style={{ marginLeft: 8 }}>×{r.eventCount ?? 0}</span>
                           </div>
 
-                          {/* line 3: risk changed */}
+                          {/* ✅ mini “trust” lines */}
                           <div style={{ marginTop: 6, fontSize: 12, color: "#6d7175" }}>
-                            Risk changed: <span>{formatDate(r.lastRiskChangeAt)}</span>
+                            {t(lang, "riskChanged")}: {formatDate(r.lastRiskChangeAt)}
                           </div>
-
-                          {/* line 4: decision */}
-                          <div style={{ marginTop: 4, fontSize: 12, color: "#6d7175" }}>
-                            Decision:{" "}
+                          <div style={{ marginTop: 2, fontSize: 12, color: "#6d7175" }}>
+                            {t(lang, "decision")}:{" "}
                             <code style={codeInline}>
                               {r.lastDecision ?? "—"}
-                              {r.lastDecision === "SKIPPED" ? ` (${r.skipReason ?? "—"})` : ""}
+                              {r.skipReason ? ` (${r.skipReason})` : ""}
                             </code>
                           </div>
                         </td>
 
+                        <td style={td}>{formatDate(r.updatedAt)}</td>
 
-                        {/* Order */}
                         <td style={tdStrong}>
                           {r.orderName}
                           <div style={{ marginTop: 4, fontSize: 12, color: "#6d7175" }}>
@@ -464,15 +535,12 @@ export default function AppIndex() {
                           </div>
                         </td>
 
-                        {/* Score */}
                         <td style={td}>{r.score}</td>
 
-                        {/* Risk */}
                         <td style={td}>
                           <span style={riskPill(r.riskLevel)}>{r.riskLevel}</span>
                         </td>
 
-                        {/* Top reasons */}
                         <td style={td}>
                           {Array.isArray(r.reasons) && r.reasons.length ? (
                             <ul style={{ margin: 0, paddingLeft: 18 }}>
@@ -489,11 +557,10 @@ export default function AppIndex() {
                           )}
                         </td>
 
-                        {/* Link */}
                         <td style={td}>
                           {r.orderAdminUrl ? (
                             <a href={r.orderAdminUrl} target="_blank" rel="noreferrer" style={link}>
-                              Open
+                              {t(lang, "open")}
                             </a>
                           ) : (
                             <span style={subtle}>—</span>
@@ -506,97 +573,42 @@ export default function AppIndex() {
               </div>
             )}
           </section>
-          <div style={{ height: 12 }} />
-
-          <section style={card}>
-            <div style={cardHeaderRow}>
-              <h2 style={h2}>Recent events</h2>
-              <div style={subtle}>Last 20 webhooks received</div>
-            </div>
-
-            <div style={divider} />
-
-            {(!data.events || data.events.length === 0) ? (
-              <EmptyState>No events yet.</EmptyState>
-            ) : (
-              <div style={{ overflowX: "auto" }}>
-                <table style={tableOrders}>
-                  <thead>
-                    <tr>
-                      <th style={th}>Time</th>
-                      <th style={th}>Topic</th>
-                      <th style={th}>Order</th>
-                      <th style={th}>Decision</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {data.events.map((e: any) => (
-                      <tr key={e.id}>
-                        <td style={td}>{formatDate(e.eventAt)}</td>
-                        <td style={td}>
-                          <code style={codeInline}>{e.topic}</code>
-                        </td>
-                        <td style={tdStrong}>
-                          {e.orderName || "—"}
-                          <div style={{ marginTop: 4, fontSize: 12, color: "#6d7175" }}>
-                            <code style={codeInline}>{shortGid(e.orderGid)}</code>
-                          </div>
-                        </td>
-                        <td style={td}>
-                          <code style={codeInline}>
-                            {e.decision ?? "—"}{e.skipReason ? ` (${e.skipReason})` : ""}
-                          </code>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
-          </section>
-
         </>
       ) : (
-        <RulesInline data={data} />
+        <RulesInline data={data} lang={lang} />
       )}
     </div>
   );
 }
 
-/* ---------- Rules inline editor (useFetcher autosave + status) ---------- */
+/* ---------- Rules inline editor ---------- */
 
-function RulesInline({ data }: { data: LoaderData }) {
+function RulesInline({ data, lang }: { data: LoaderData; lang: Lang }) {
   const [localRules, setLocalRules] = useState<Rule[]>(data.rules);
   useEffect(() => setLocalRules(data.rules), [data.rules]);
 
-  // fetchers
   const addFetcher = useFetcher<ActionData>();
   const seedFetcher = useFetcher<ActionData>();
   const saveFetcher = useFetcher<ActionData>();
-  const mutateFetcher = useFetcher<ActionData>(); // toggle/delete
+  const mutateFetcher = useFetcher<ActionData>();
 
   const addFormRef = useRef<HTMLFormElement | null>(null);
 
-  // autosave timers
   const timersRef = useRef<Record<string, number>>({});
   const lastPayloadRef = useRef<Record<string, string>>({});
 
   const allowedTypes: RuleType[] = ["ORDER_VALUE", "FIRST_TIME", "HIGH_QTY", "COUNTRY_MISMATCH"];
   const allowedOps: RuleOp[] = [">", ">=", "=", "!=", "<", "<="];
 
-  // status pill
-  const [ui, setUi] = useState<{ state: "idle" | "saving" | "saved" | "error"; msg?: string }>({
-    state: "idle",
-  });
+  const [ui, setUi] = useState<{ state: "idle" | "saving" | "saved" | "error"; msg?: string }>({ state: "idle" });
 
   const statusLabel = useMemo(() => {
-    if (ui.state === "saving") return { text: "Saving…", style: statusPill("saving") };
-    if (ui.state === "saved") return { text: "Saved", style: statusPill("saved") };
-    if (ui.state === "error") return { text: ui.msg ? `Error: ${ui.msg}` : "Error", style: statusPill("error") };
-    return { text: "—", style: statusPill("idle") };
-  }, [ui]);
+    if (ui.state === "saving") return { text: t(lang, "saving"), style: statusPill("saving") };
+    if (ui.state === "saved") return { text: t(lang, "saved"), style: statusPill("saved") };
+    if (ui.state === "error") return { text: ui.msg ? `${t(lang, "error")}: ${ui.msg}` : t(lang, "error"), style: statusPill("error") };
+    return { text: t(lang, "idleDash"), style: statusPill("idle") };
+  }, [ui, lang]);
 
-  // reflect saveFetcher state into UI
   useEffect(() => {
     if (saveFetcher.state === "submitting") setUi({ state: "saving" });
     if (saveFetcher.state === "idle" && saveFetcher.data) {
@@ -610,37 +622,26 @@ function RulesInline({ data }: { data: LoaderData }) {
     }
   }, [saveFetcher.state, saveFetcher.data]);
 
-  // handle addRule result -> prepend into localRules + reset form
   useEffect(() => {
     const d = addFetcher.data;
-    if (!d) return;
-    if (!d.ok) return;
-    if (d.op !== "addRule") return;
-
+    if (!d || !d.ok || d.op !== "addRule") return;
     setLocalRules((prev) => [d.rule, ...prev]);
     addFormRef.current?.reset();
-
     setUi({ state: "saved" });
     window.setTimeout(() => setUi((s) => (s.state === "saved" ? { state: "idle" } : s)), 900);
   }, [addFetcher.data]);
 
-  // ✅ handle seed defaults -> set localRules
   useEffect(() => {
     const d = seedFetcher.data;
-    if (!d) return;
-    if (!d.ok) return;
-    if (d.op !== "seedDefaults") return;
-
+    if (!d || !d.ok || d.op !== "seedDefaults") return;
     setLocalRules(d.rules);
     setUi({ state: "saved" });
     window.setTimeout(() => setUi((s) => (s.state === "saved" ? { state: "idle" } : s)), 900);
   }, [seedFetcher.data]);
 
-  // handle toggle/delete result -> update localRules
   useEffect(() => {
     const d = mutateFetcher.data;
-    if (!d) return;
-    if (!d.ok) return;
+    if (!d || !d.ok) return;
 
     if (d.op === "toggleRule") {
       setLocalRules((prev) => prev.map((r) => (r.id === d.id ? { ...r, enabled: d.enabled } : r)));
@@ -687,9 +688,7 @@ function RulesInline({ data }: { data: LoaderData }) {
       return;
     }
 
-    timersRef.current[id] = window.setTimeout(() => {
-      submitUpdate(rule);
-    }, 700);
+    timersRef.current[id] = window.setTimeout(() => submitUpdate(rule), 700);
   }
 
   function updateRuleLocal(id: string, patch: Partial<Rule>, saveMode: "debounce" | "blur" = "debounce") {
@@ -710,7 +709,7 @@ function RulesInline({ data }: { data: LoaderData }) {
   }
 
   function deleteRule(id: string) {
-    if (!confirm("Delete this rule?")) return;
+    if (!confirm(t(lang, "deleteConfirm"))) return;
     const fd = new FormData();
     fd.set("_action", "deleteRule");
     fd.set("id", id);
@@ -721,9 +720,9 @@ function RulesInline({ data }: { data: LoaderData }) {
     <section style={card}>
       <div style={cardHeaderRow}>
         <div>
-          <h2 style={h2}>Rules</h2>
+          <h2 style={h2}>{t(lang, "rulesTitle")}</h2>
           <div style={subtle}>
-            Inline edit · thresholds are in <b>{data.currency}</b>
+            {t(lang, "rulesSubtitle")} <b>{data.currency}</b>
           </div>
         </div>
 
@@ -736,19 +735,21 @@ function RulesInline({ data }: { data: LoaderData }) {
 
       {localRules.length === 0 ? (
         <>
-          <EmptyState>No rules yet. Add your first rule below.</EmptyState>
+          <EmptyState title={t(lang, "noChecksYetTitle")}>{t(lang, "noRulesYetText")}</EmptyState>
 
-          {/* ✅ Default rules button (only when no rules) */}
+          {/* Default rules button (only when no rules) */}
           <div style={{ marginTop: 12, display: "flex", gap: 10, alignItems: "center" }}>
             <seedFetcher.Form method="post" action="?index">
               <input type="hidden" name="_action" value="seedDefaultRules" />
               <button type="submit" style={primaryBtn} disabled={seedFetcher.state !== "idle"}>
-                {seedFetcher.state === "submitting" ? "Adding defaults…" : "Add default rules"}
+                {seedFetcher.state === "submitting" ? t(lang, "addingDefaults") : t(lang, "addDefaultRules")}
               </button>
             </seedFetcher.Form>
 
             {seedFetcher.data && !seedFetcher.data.ok ? (
-              <div style={{ fontSize: 13, color: "#8a2a0a" }}>Error: {seedFetcher.data.error}</div>
+              <div style={{ fontSize: 13, color: "#8a2a0a" }}>
+                {t(lang, "error")}: {seedFetcher.data.error}
+              </div>
             ) : null}
           </div>
         </>
@@ -767,12 +768,12 @@ function RulesInline({ data }: { data: LoaderData }) {
 
             <thead>
               <tr>
-                <th style={th}>Enabled</th>
-                <th style={th}>Type</th>
-                <th style={th}>Operator</th>
-                <th style={th}>Value</th>
-                <th style={th}>Points</th>
-                <th style={th}>Action</th>
+                <th style={th}>{t(lang, "enabled")}</th>
+                <th style={th}>{t(lang, "type")}</th>
+                <th style={th}>{t(lang, "operator")}</th>
+                <th style={th}>{t(lang, "value")}</th>
+                <th style={th}>{t(lang, "points")}</th>
+                <th style={th}>{t(lang, "action")}</th>
                 <th style={th}></th>
               </tr>
             </thead>
@@ -787,7 +788,7 @@ function RulesInline({ data }: { data: LoaderData }) {
                       style={toggleBtn(r.enabled)}
                       disabled={mutateFetcher.state !== "idle"}
                     >
-                      {r.enabled ? "On" : "Off"}
+                      {r.enabled ? t(lang, "on") : t(lang, "off")}
                     </button>
                   </td>
 
@@ -798,9 +799,9 @@ function RulesInline({ data }: { data: LoaderData }) {
                       onChange={(e) => updateRuleLocal(r.id, { type: e.target.value as RuleType })}
                       onBlur={() => scheduleSave(r, true)}
                     >
-                      {allowedTypes.map((t) => (
-                        <option key={t} value={t}>
-                          {t}
+                      {allowedTypes.map((tt) => (
+                        <option key={tt} value={tt}>
+                          {tt}
                         </option>
                       ))}
                     </select>
@@ -860,7 +861,7 @@ function RulesInline({ data }: { data: LoaderData }) {
                       style={dangerBtn}
                       disabled={mutateFetcher.state !== "idle"}
                     >
-                      Delete
+                      {t(lang, "delete")}
                     </button>
                   </td>
                 </tr>
@@ -871,13 +872,13 @@ function RulesInline({ data }: { data: LoaderData }) {
       )}
 
       <div style={{ height: 16 }} />
-      <h3 style={h3}>Add rule</h3>
+      <h3 style={h3}>{t(lang, "addRuleTitle")}</h3>
 
       <addFetcher.Form ref={addFormRef} method="post" action="?index" style={formGrid}>
         <input type="hidden" name="_action" value="addRule" />
 
         <label style={field}>
-          <span style={label}>Type</span>
+          <span style={label}>{t(lang, "type")}</span>
           <select name="type" defaultValue="ORDER_VALUE" style={control}>
             <option value="ORDER_VALUE">ORDER_VALUE</option>
             <option value="FIRST_TIME">FIRST_TIME</option>
@@ -887,7 +888,7 @@ function RulesInline({ data }: { data: LoaderData }) {
         </label>
 
         <label style={field}>
-          <span style={label}>Operator</span>
+          <span style={label}>{t(lang, "operator")}</span>
           <select name="operator" defaultValue=">" style={control}>
             <option value=">">{">"}</option>
             <option value=">=">{">="}</option>
@@ -899,46 +900,50 @@ function RulesInline({ data }: { data: LoaderData }) {
         </label>
 
         <label style={field}>
-          <span style={label}>Value</span>
+          <span style={label}>{t(lang, "value")}</span>
           <input name="value" placeholder="300 / true / DE" style={control} />
         </label>
 
         <label style={field}>
-          <span style={label}>Points</span>
+          <span style={label}>{t(lang, "points")}</span>
           <input name="points" placeholder="15" defaultValue="15" style={control} />
         </label>
 
         <label style={field}>
-          <span style={label}>Action</span>
+          <span style={label}>{t(lang, "action")}</span>
           <input name="action" placeholder="TAG:high_value / REVIEW / HOLD" style={control} />
         </label>
 
         <div style={{ display: "flex", alignItems: "end" }}>
           <button type="submit" style={primaryBtn} disabled={addFetcher.state !== "idle"}>
-            {addFetcher.state === "submitting" ? "Adding…" : "Add rule"}
+            {addFetcher.state === "submitting" ? t(lang, "addingRule") : t(lang, "addRuleBtn")}
           </button>
         </div>
       </addFetcher.Form>
 
       {addFetcher.data && !addFetcher.data.ok ? (
-        <div style={{ marginTop: 10, fontSize: 13, color: "#8a2a0a" }}>Error: {addFetcher.data.error}</div>
+        <div style={{ marginTop: 10, fontSize: 13, color: "#8a2a0a" }}>
+          {t(lang, "error")}: {addFetcher.data.error}
+        </div>
       ) : null}
 
       <div style={{ marginTop: 10, fontSize: 13, color: "#6d7175" }}>
-        Examples: <code style={codeInline}>FIRST_TIME = true</code>, <code style={codeInline}>ORDER_VALUE &gt; 300</code>,{" "}
-        <code style={codeInline}>REVIEW</code>.
+        {t(lang, "examples")}: <code style={codeInline}>FIRST_TIME = true</code>,{" "}
+        <code style={codeInline}>ORDER_VALUE &gt; 300</code>, <code style={codeInline}>REVIEW</code>.
       </div>
     </section>
   );
 }
 
-/* ---------- Setup checklist (C.5) ---------- */
+/* ---------- Setup checklist ---------- */
 
 function SetupChecklist({
+  lang,
   hasRules,
   hasChecks,
   shop,
 }: {
+  lang: Lang;
   hasRules: boolean;
   hasChecks: boolean;
   shop: string;
@@ -952,10 +957,10 @@ function SetupChecklist({
     <section style={checkCard}>
       <div style={checkHeader}>
         <div>
-          <div style={{ fontWeight: 800 }}>Setup checklist</div>
-          <div style={{ color: "#6d7175", fontSize: 13 }}>2 steps to start seeing consistent risk checks.</div>
+          <div style={{ fontWeight: 800 }}>{t(lang, "setupChecklistTitle")}</div>
+          <div style={{ color: "#6d7175", fontSize: 13 }}>{t(lang, "setupChecklistSubtitle")}</div>
         </div>
-        <span style={pillMini("warn")}>Setup</span>
+        <span style={pillMini("warn")}>{t(lang, "setup")}</span>
       </div>
 
       <div style={{ height: 10 }} />
@@ -963,29 +968,25 @@ function SetupChecklist({
       <div style={checkList}>
         <CheckItem
           done={hasRules}
-          title="Create rules"
-          desc={hasRules ? "Rules are configured." : "Go to Rules tab and add your first rules."}
+          title={t(lang, "createRulesTitle")}
+          desc={hasRules ? t(lang, "createRulesDone") : t(lang, "createRulesTodo")}
         />
 
         <CheckItem
           done={hasChecks}
-          title="Receive webhook events"
-          desc={
-            hasChecks
-              ? "Webhook events are arriving and checks are being saved."
-              : "Create a test order and update it to trigger orders/create and orders/updated."
-          }
+          title={t(lang, "receiveWebhooksTitle")}
+          desc={hasChecks ? t(lang, "receiveWebhooksDone") : t(lang, "receiveWebhooksTodo")}
           extra={
             !hasChecks ? (
               <div style={{ marginTop: 6, fontSize: 13, color: "#202223" }}>
-                Quick link:{" "}
+                {t(lang, "quickLink")}:{" "}
                 <a
                   href={`https://admin.shopify.com/store/${storeHandle}/orders`}
                   target="_blank"
                   rel="noreferrer"
                   style={link}
                 >
-                  Open Orders in Admin
+                  {t(lang, "openOrdersInAdmin")}
                 </a>
               </div>
             ) : null
@@ -1059,10 +1060,10 @@ function formatDate(iso: string | null | undefined) {
   return d.toLocaleString();
 }
 
-function EmptyState({ children }: { children: React.ReactNode }) {
+function EmptyState({ title, children }: { title: string; children: React.ReactNode }) {
   return (
     <div style={empty}>
-      <div style={{ fontWeight: 600, marginBottom: 4 }}>Nothing here yet</div>
+      <div style={{ fontWeight: 600, marginBottom: 4 }}>{title}</div>
       <div style={{ color: "#6d7175" }}>{children}</div>
     </div>
   );
@@ -1100,6 +1101,15 @@ const tabsWrap: React.CSSProperties = {
   display: "flex",
   gap: 8,
   marginBottom: 12,
+};
+
+const langSelect: React.CSSProperties = {
+  padding: "10px 10px",
+  borderRadius: 12,
+  border: "1px solid #dfe3e8",
+  background: "#ffffff",
+  fontSize: 13,
+  outline: "none",
 };
 
 function tabBtn(active: boolean): React.CSSProperties {
