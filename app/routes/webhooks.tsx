@@ -9,6 +9,8 @@ import { createOrderRiskAssessment } from "../riskmate/orderRiskAssessment.serve
 import { setOrderRiskTags } from "../riskmate/shopifyActions.server";
 import crypto from "crypto";
 import prisma from "../db.server";
+import { logRiskEvent } from "../riskmate/riskEventStore.server";
+
 
 function normalizeTopic(topic: unknown) {
   const t = String(topic ?? "").toLowerCase().trim();
@@ -127,6 +129,17 @@ export async function action({ request }: ActionFunctionArgs) {
       payloadHash,
       lastTopic: t,
       lastEventAt: eventAt,
+    });
+
+    await logRiskEvent({
+      shop,
+      orderGid,
+      orderName: orderName ?? "",
+      topic: t,
+      eventAt: eventAt,
+      payloadHash,
+      decision: store.skipped ? "SKIPPED" : "APPLIED",
+      skipReason: store.skipped ? "UNCHANGED" : null,
     });
 
     if (store.skipped) {

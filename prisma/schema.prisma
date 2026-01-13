@@ -82,4 +82,25 @@ model RiskRule {
   @@index([shop])
 }
 
+model RiskEvent {
+  id         String   @id @default(cuid())
+
+  shop       String
+  orderGid   String
+  orderName  String
+
+  topic      String
+  eventAt    DateTime
+  payloadHash String?
+
+  decision   String?  // "APPLIED" | "SKIPPED"
+  skipReason String?  // "UNCHANGED" | "NO_RULES" | etc.
+
+  createdAt  DateTime @default(now())
+
+  @@index([shop, createdAt])
+  @@index([shop, orderGid, createdAt])
+  @@index([shop, eventAt])
+}
+
 

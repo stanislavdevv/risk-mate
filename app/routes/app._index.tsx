@@ -21,6 +21,17 @@ type Rule = {
   createdAt: string;
 };
 
+type RiskEventRow = {
+  id: string;
+  orderGid: string;
+  orderName: string;
+  topic: string;
+  eventAt: string;
+  decision: string | null;
+  skipReason: string | null;
+};
+
+
 type Row = {
   id: string;
   orderGid: string;
@@ -81,6 +92,13 @@ export async function loader({ request }: LoaderFunctionArgs) {
     take: 50,
   });
 
+  const events = await prisma.riskEvent.findMany({
+    where: { shop: session.shop },
+    orderBy: { createdAt: "desc" },
+    take: 20,
+  });
+
+
   const hasRules = rules.length > 0;
   const hasChecks = items.length > 0;
 
@@ -103,6 +121,15 @@ export async function loader({ request }: LoaderFunctionArgs) {
         createdAt: r.createdAt.toISOString(),
       }),
     ),
+    events: events.map((e) => ({
+      id: e.id,
+      orderGid: e.orderGid,
+      orderName: e.orderName,
+      topic: e.topic,
+      eventAt: e.eventAt.toISOString(),
+      decision: e.decision ?? null,
+      skipReason: e.skipReason ?? null,
+    })),
     rows: items.map(
       (it): Row => {
         const orderId = orderIdFromGid(it.orderGid);
@@ -479,6 +506,55 @@ export default function AppIndex() {
               </div>
             )}
           </section>
+          <div style={{ height: 12 }} />
+
+          <section style={card}>
+            <div style={cardHeaderRow}>
+              <h2 style={h2}>Recent events</h2>
+              <div style={subtle}>Last 20 webhooks received</div>
+            </div>
+
+            <div style={divider} />
+
+            {(!data.events || data.events.length === 0) ? (
+              <EmptyState>No events yet.</EmptyState>
+            ) : (
+              <div style={{ overflowX: "auto" }}>
+                <table style={tableOrders}>
+                  <thead>
+                    <tr>
+                      <th style={th}>Time</th>
+                      <th style={th}>Topic</th>
+                      <th style={th}>Order</th>
+                      <th style={th}>Decision</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {data.events.map((e: any) => (
+                      <tr key={e.id}>
+                        <td style={td}>{formatDate(e.eventAt)}</td>
+                        <td style={td}>
+                          <code style={codeInline}>{e.topic}</code>
+                        </td>
+                        <td style={tdStrong}>
+                          {e.orderName || "—"}
+                          <div style={{ marginTop: 4, fontSize: 12, color: "#6d7175" }}>
+                            <code style={codeInline}>{shortGid(e.orderGid)}</code>
+                          </div>
+                        </td>
+                        <td style={td}>
+                          <code style={codeInline}>
+                            {e.decision ?? "—"}{e.skipReason ? ` (${e.skipReason})` : ""}
+                          </code>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </section>
+
         </>
       ) : (
         <RulesInline data={data} />
