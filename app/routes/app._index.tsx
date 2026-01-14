@@ -30,6 +30,7 @@ type RiskEventRow = {
   eventAt: string;
   decision: string | null;
   skipReason: string | null;
+  orderAdminUrl: string | null; // ✅ добавили ссылку
 };
 
 type Row = {
@@ -89,11 +90,11 @@ export async function loader({ request }: LoaderFunctionArgs) {
 
   const items = await prisma.riskResult.findMany({
     where,
-    orderBy: { updatedAt: "desc" },
-    take: 50,
+    orderBy: tab === "events" ? [{ lastEventAt: "desc" }, { updatedAt: "desc" }] : [{ updatedAt: "desc" }],
+    take: tab === "events" ? 100 : 50,
   });
 
-  // optional: recent events section (if model exists)
+  // recent events (if model exists)
   let events: any[] = [];
   try {
     events = await prisma.riskEvent.findMany({
@@ -128,17 +129,26 @@ export async function loader({ request }: LoaderFunctionArgs) {
         createdAt: r.createdAt.toISOString(),
       }),
     ),
+
+    // ✅ events теперь сразу содержат ссылку на заказ
     events: events.map(
-      (e): RiskEventRow => ({
-        id: e.id,
-        orderGid: e.orderGid,
-        orderName: e.orderName,
-        topic: e.topic,
-        eventAt: e.eventAt.toISOString(),
-        decision: e.decision ?? null,
-        skipReason: e.skipReason ?? null,
-      }),
+      (e): RiskEventRow => {
+        const orderId = orderIdFromGid(e.orderGid);
+        const orderAdminUrl = orderId ? shopifyAdminOrderUrl(session.shop, orderId) : null;
+
+        return {
+          id: e.id,
+          orderGid: e.orderGid,
+          orderName: e.orderName,
+          topic: e.topic,
+          eventAt: e.eventAt.toISOString(),
+          decision: e.decision ?? null,
+          skipReason: e.skipReason ?? null,
+          orderAdminUrl,
+        };
+      },
     ),
+
     rows: items.map(
       (it): Row => {
         const orderId = orderIdFromGid(it.orderGid);
@@ -357,7 +367,9 @@ export default function AppIndex() {
   const tab = (params.get("tab") ?? "orders").toLowerCase();
   const level = (params.get("level") ?? "ALL").toUpperCase();
 
-  const setTab = (next: "orders" | "rules") => {
+  type Tab = "orders" | "rules" | "events";
+
+  const setTab = (next: Tab) => {
     const p = new URLSearchParams(params);
     p.set("tab", next);
     setParams(p);
@@ -404,6 +416,9 @@ export default function AppIndex() {
         <button type="button" onClick={() => setTab("rules")} style={tabBtn(tab === "rules")}>
           {t(lang, "tabRules")}
         </button>
+        <button type="button" onClick={() => setTab("events")} style={tabBtn(tab === "events")}>
+          {t(lang, "tabEvents")}
+        </button>
       </div>
 
       {tab === "orders" ? (
@@ -411,58 +426,7 @@ export default function AppIndex() {
           <SetupChecklist lang={lang} hasRules={data.hasRules} hasChecks={data.hasChecks} shop={data.shop} />
           <div style={{ height: 12 }} />
 
-          {/* Recent events */}
-          <section style={card}>
-            <div style={cardHeaderRow}>
-              <div>
-                <h2 style={h2}>{t(lang, "recentEventsTitle")}</h2>
-                <div style={subtle}>{t(lang, "recentEventsSubtitle")}</div>
-              </div>
-            </div>
-
-            <div style={divider} />
-
-            {!data.events || data.events.length === 0 ? (
-              <EmptyState title={t(lang, "noChecksYetTitle")}>{t(lang, "noEventsYet")}</EmptyState>
-            ) : (
-              <div style={{ overflowX: "auto" }}>
-                <table style={tableOrders}>
-                  <thead>
-                    <tr>
-                      <th style={th}>{t(lang, "evTime")}</th>
-                      <th style={th}>{t(lang, "evTopic")}</th>
-                      <th style={th}>{t(lang, "evOrder")}</th>
-                      <th style={th}>{t(lang, "evDecision")}</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {data.events.map((e) => (
-                      <tr key={e.id}>
-                        <td style={td}>{formatDate(e.eventAt)}</td>
-                        <td style={td}>
-                          <code style={codeInline}>{e.topic}</code>
-                        </td>
-                        <td style={tdStrong}>
-                          {e.orderName || "—"}
-                          <div style={{ marginTop: 4, fontSize: 12, color: "#6d7175" }}>
-                            <code style={codeInline}>{shortGid(e.orderGid)}</code>
-                          </div>
-                        </td>
-                        <td style={td}>
-                          <code style={codeInline}>
-                            {e.decision ?? "—"}
-                            {e.skipReason ? ` (${e.skipReason})` : ""}
-                          </code>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
-          </section>
-
-          <div style={{ height: 12 }} />
+          {/* ✅ ВАЖНО: Recent events БОЛЬШЕ НЕ показываем в Orders */}
 
           <section style={card}>
             <div style={cardHeaderRow}>
@@ -574,8 +538,10 @@ export default function AppIndex() {
             )}
           </section>
         </>
-      ) : (
+      ) : tab === "rules" ? (
         <RulesInline data={data} lang={lang} />
+      ) : (
+        <EventsTab data={data} lang={lang} />
       )}
     </div>
   );
@@ -605,7 +571,8 @@ function RulesInline({ data, lang }: { data: LoaderData; lang: Lang }) {
   const statusLabel = useMemo(() => {
     if (ui.state === "saving") return { text: t(lang, "saving"), style: statusPill("saving") };
     if (ui.state === "saved") return { text: t(lang, "saved"), style: statusPill("saved") };
-    if (ui.state === "error") return { text: ui.msg ? `${t(lang, "error")}: ${ui.msg}` : t(lang, "error"), style: statusPill("error") };
+    if (ui.state === "error")
+      return { text: ui.msg ? `${t(lang, "error")}: ${ui.msg}` : t(lang, "error"), style: statusPill("error") };
     return { text: t(lang, "idleDash"), style: statusPill("idle") };
   }, [ui, lang]);
 
@@ -737,7 +704,6 @@ function RulesInline({ data, lang }: { data: LoaderData; lang: Lang }) {
         <>
           <EmptyState title={t(lang, "noChecksYetTitle")}>{t(lang, "noRulesYetText")}</EmptyState>
 
-          {/* Default rules button (only when no rules) */}
           <div style={{ marginTop: 12, display: "flex", gap: 10, alignItems: "center" }}>
             <seedFetcher.Form method="post" action="?index">
               <input type="hidden" name="_action" value="seedDefaultRules" />
@@ -931,6 +897,77 @@ function RulesInline({ data, lang }: { data: LoaderData; lang: Lang }) {
         {t(lang, "examples")}: <code style={codeInline}>FIRST_TIME = true</code>,{" "}
         <code style={codeInline}>ORDER_VALUE &gt; 300</code>, <code style={codeInline}>REVIEW</code>.
       </div>
+    </section>
+  );
+}
+
+/* ---------- Events tab (✅ теперь тут Recent events блок) ---------- */
+
+function EventsTab({ data, lang }: { data: LoaderData; lang: Lang }) {
+  return (
+    <section style={card}>
+      <div style={cardHeaderRow}>
+        <div>
+          <h2 style={h2}>{t(lang, "recentEventsTitle")}</h2>
+          <div style={subtle}>{t(lang, "recentEventsSubtitle")}</div>
+        </div>
+      </div>
+
+      <div style={divider} />
+
+      {!data.events || data.events.length === 0 ? (
+        <EmptyState title={t(lang, "noChecksYetTitle")}>{t(lang, "noEventsYet")}</EmptyState>
+      ) : (
+        <div style={{ overflowX: "auto" }}>
+          <table style={tableOrders}>
+            <thead>
+              <tr>
+                <th style={th}>{t(lang, "evTime")}</th>
+                <th style={th}>{t(lang, "evTopic")}</th>
+                <th style={th}>{t(lang, "evOrder")}</th>
+                <th style={th}>{t(lang, "evDecision")}</th>
+                <th style={th}>{t(lang, "thLink")}</th>
+              </tr>
+            </thead>
+
+            <tbody>
+              {data.events.map((e) => (
+                <tr key={e.id}>
+                  <td style={td}>{formatDate(e.eventAt)}</td>
+
+                  <td style={td}>
+                    <code style={codeInline}>{e.topic}</code>
+                  </td>
+
+                  <td style={tdStrong}>
+                    {e.orderName || "—"}
+                    <div style={{ marginTop: 4, fontSize: 12, color: "#6d7175" }}>
+                      <code style={codeInline}>{shortGid(e.orderGid)}</code>
+                    </div>
+                  </td>
+
+                  <td style={td}>
+                    <code style={codeInline}>
+                      {e.decision ?? "—"}
+                      {e.skipReason ? ` (${e.skipReason})` : ""}
+                    </code>
+                  </td>
+
+                  <td style={td}>
+                    {e.orderAdminUrl ? (
+                      <a href={e.orderAdminUrl} target="_blank" rel="noreferrer" style={link}>
+                        {t(lang, "open")}
+                      </a>
+                    ) : (
+                      <span style={subtle}>—</span>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
     </section>
   );
 }

@@ -1,236 +1,236 @@
-# Shopify App Template - React Router
+# RiskMate (Shopify embedded app) — README (dev log + spec)
 
-This is a template for building a [Shopify app](https://shopify.dev/docs/apps/getting-started) using [React Router](https://reactrouter.com/). It was forked from the [Shopify Remix app template](https://github.com/Shopify/shopify-app-template-remix) and converted to React Router.
+RiskMate — embedded Shopify app (2026 flow) для **deterministic** (rule-based) оценки риска заказов.
+Цель MVP: автоматически ставить **risk-level** (LOW/MEDIUM/HIGH), сохранять результат в БД, и делать сайд-эффекты в Shopify:
+- tags (`risk:<level>` и/или status tags)
+- Order Risk Assessment в заказе (видно в Admin)
 
-Rather than cloning this repo, follow the [Quick Start steps](https://github.com/Shopify/shopify-app-template-react-router#quick-start).
+Ключевая идея: **никакого AI в ядре** (пока), только прозрачные правила, понятные причины и “trust features” (что случилось, когда и почему).
 
-Visit the [`shopify.dev` documentation](https://shopify.dev/docs/api/shopify-app-react-router) for more details on the React Router app package.
+---
 
-## Upgrading from Remix
+## TL;DR: что уже сделано (актуальное состояние)
 
-If you have an existing Remix app that you want to upgrade to React Router, please follow the [upgrade guide](https://github.com/Shopify/shopify-app-template-react-router/wiki/Upgrading-from-Remix). Otherwise, please follow the quick start guide below.
+### 1) Shopify app (2026 flow)
+- Шаблон на **React Router template** (не Remix).
+- Авторизация через `authenticate.admin` / `authenticate.webhook` из `shopify.server.ts`.
+- Webhooks подключены и работают (orders/create, orders/updated, orders/paid — если включено, app/uninstalled).
 
-## Quick start
+### 2) Risk engine (deterministic)
+- Rule-based движок, считает `score`, `riskLevel`, `reasonsJson`, `facts`.
+- Поддерживаемые типы правил (MVP):
+  - `ORDER_VALUE`
+  - `FIRST_TIME`
+  - `HIGH_QTY`
+  - `COUNTRY_MISMATCH`
+- Rules CRUD в UI (add / inline edit autosave / toggle / delete).
 
-### Prerequisites
+### 3) Storage (Prisma)
+- Prisma используется как основная БД:
+  - sessions в Prisma
+  - `RiskRule`
+  - `RiskResult`
+- `RiskResult` имеет “trust features” и идемпотентность на stable-hash:
+  - `payloadHash` — SHA1 от “stable fields” payload
+  - `lastTopic`, `lastEventAt`, `eventCount`
+  - `lastDecision`, `skipReason`
+  - (опционально) `lastRiskChangeAt` — когда реально поменялся риск
 
-Before you begin, you'll need to [download and install the Shopify CLI](https://shopify.dev/docs/apps/tools/cli/getting-started) if you haven't already.
+### 4) Webhook idempotency + trust features
+- На вебхуке считаем `payloadHash` только от стабильных полей заказа (без protected data).
+- Логика:
+  - если `payloadHash` не изменился → **SKIPPED (UNCHANGED)**, но trust-поля обновляем (eventCount/lastEventAt/lastTopic/decision/skipReason).
+  - если изменился → пересчёт риска + запись + сайд-эффекты → **APPLIED**.
 
-### Setup
+### 5) Shopify side-effects
+- Проставляем risk tags (например `risk:high`) + чистим/обновляем статусные теги (MVP).
+- Создаём Order Risk Assessment (видно в заказе).
+
+### 6) UI (без Polaris)
+- 3 таба:
+  - **Orders**: таблица результатов (risk/score/reasons + trust поля)
+  - **Rules**: CRUD правил + seed default rules
+  - **Events**: таблица последних webhook событий (решение APPLIED/SKIPPED + ссылка на заказ)
+- Есть setup-checklist для пустого магазина.
+- Добавлена мультиязычность через словари `app/i18n/strings.ts` (`t(lang, key)` + `parseLang` + `SUPPORTED_LANGS`).
 
-```shell
-shopify app init --template=https://github.com/Shopify/shopify-app-template-react-router
-```
+---
 
-### Local Development
+## Стек / зависимости
 
-```shell
-shopify app dev
-```
+- Node.js (через Shopify CLI / Vite dev)
+- React + React Router (Shopify 2026 template)
+- Prisma + DB (локально обычно SQLite, в проде можно Postgres)
+- Shopify Admin GraphQL API (теги, ассессмент, currencyCode и т.п.)
+- Без Polaris (UI на чистом React + inline styles)
 
-Press P to open the URL to your app. Once you click install, you can start development.
+---
 
-Local development is powered by [the Shopify CLI](https://shopify.dev/docs/apps/tools/cli). It logs into your account, connects to an app, provides environment variables, updates remote config, creates a tunnel and provides commands to generate extensions.
+## Важные файлы/папки (ориентир)
 
-### Authenticating and querying data
+> Пути могут немного отличаться, но логика такая:
 
-To authenticate and query data you can use the `shopify` const that is exported from `/app/shopify.server.js`:
+- `app/routes/webhooks.tsx`  
+  Принимает webhooks, нормализует topic, вычисляет stable hash, вызывает risk engine, пишет в store, делает сайд-эффекты.
 
-```js
-export async function loader({ request }) {
-  const { admin } = await shopify.authenticate.admin(request);
+- `app/riskmate/riskEngine.server.ts`  
+  Deterministic risk engine: берёт payload + rules → возвращает `{ score, riskLevel, reasonsJson, facts }`.
 
-  const response = await admin.graphql(`
-    {
-      products(first: 25) {
-        nodes {
-          title
-          description
-        }
-      }
-    }`);
+- `app/riskmate/riskStore.server.ts`  
+  `upsertRiskIfChanged(...)` — центральное место идемпотентности и trust полей.
 
-  const {
-    data: {
-      products: { nodes },
-    },
-  } = await response.json();
+- `app/riskmate/shopifyActions.server.ts`  
+  Действия в Shopify: теги/очистка/и т.д.
 
-  return nodes;
-}
-```
+- `app/riskmate/orderRiskAssessment.server.ts`  
+  Создание Order Risk Assessment.
 
-This template comes pre-configured with examples of:
+- `app/routes/app._index.tsx`  
+  UI: табы Orders/Rules/Events + loader/action + i18n.
 
-1. Setting up your Shopify app in [/app/shopify.server.ts](https://github.com/Shopify/shopify-app-template-react-router/blob/main/app/shopify.server.ts)
-2. Querying data using Graphql. Please see: [/app/routes/app.\_index.tsx](https://github.com/Shopify/shopify-app-template-react-router/blob/main/app/routes/app._index.tsx).
-3. Responding to webhooks. Please see [/app/routes/webhooks.tsx](https://github.com/Shopify/shopify-app-template-react-router/blob/main/app/routes/webhooks.app.uninstalled.tsx).
+- `app/i18n/strings.ts`  
+  Словари переводов + `t()`, `parseLang()`, `SUPPORTED_LANGS`.
 
-Please read the [documentation for @shopify/shopify-app-react-router](https://shopify.dev/docs/api/shopify-app-react-router) to see what other API's are available.
+- `prisma/schema.prisma`  
+  Prisma модели (`RiskRule`, `RiskResult`, sessions, и т.п.)
 
-## Shopify Dev MCP
+- `shopify.app.toml`  
+  Конфиг Shopify app, webhooks и scopes.
 
-This template is configured with the Shopify Dev MCP. This instructs [Cursor](https://cursor.com/), [GitHub Copilot](https://github.com/features/copilot) and [Claude Code](https://claude.com/product/claude-code) and [Google Gemini CLI](https://github.com/google-gemini/gemini-cli) to use the Shopify Dev MCP.
+---
 
-For more information on the Shopify Dev MCP please read [the documentation](https://shopify.dev/docs/apps/build/devmcp).
+## Модель данных (MVP)
 
-## Deployment
+### RiskRule
+Хранит правила скоринга для магазина.
 
-### Application Storage
+Поля:
+- `type`: `ORDER_VALUE | FIRST_TIME | HIGH_QTY | COUNTRY_MISMATCH`
+- `operator`: `> | >= | = | != | < | <=`
+- `value`: строка (`"300"`, `"true"`, `"DE"`)
+- `points`: int
+- `action`: `REVIEW | HOLD | TAG:xxx` (или null)
+- `enabled`: boolean
 
-This template uses [Prisma](https://www.prisma.io/) to store session data, by default using an [SQLite](https://www.sqlite.org/index.html) database.
-The database is defined as a Prisma schema in `prisma/schema.prisma`.
+### RiskResult
+Результат вычисления риска по заказу.
 
-This use of SQLite works in production if your app runs as a single instance.
-The database that works best for you depends on the data your app needs and how it is queried.
-Here’s a short list of databases providers that provide a free tier to get started:
+Основные:
+- `shop`, `orderGid`, `orderName`
+- `score`, `riskLevel`, `reasonsJson`
 
-| Database   | Type             | Hosters                                                                                                                                                                                                                                    |
-| ---------- | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| MySQL      | SQL              | [Digital Ocean](https://www.digitalocean.com/products/managed-databases-mysql), [Planet Scale](https://planetscale.com/), [Amazon Aurora](https://aws.amazon.com/rds/aurora/), [Google Cloud SQL](https://cloud.google.com/sql/docs/mysql) |
-| PostgreSQL | SQL              | [Digital Ocean](https://www.digitalocean.com/products/managed-databases-postgresql), [Amazon Aurora](https://aws.amazon.com/rds/aurora/), [Google Cloud SQL](https://cloud.google.com/sql/docs/postgres)                                   |
-| Redis      | Key-value        | [Digital Ocean](https://www.digitalocean.com/products/managed-databases-redis), [Amazon MemoryDB](https://aws.amazon.com/memorydb/)                                                                                                        |
-| MongoDB    | NoSQL / Document | [Digital Ocean](https://www.digitalocean.com/products/managed-databases-mongodb), [MongoDB Atlas](https://www.mongodb.com/atlas/database)                                                                                                  |
+Trust/idempotency:
+- `payloadHash` (SHA1 stable fields)
+- `lastTopic`, `lastEventAt`, `eventCount`
+- `lastDecision`: `APPLIED | SKIPPED`
+- `skipReason`: `UNCHANGED | ...`
+- (опц.) `lastRiskChangeAt`
 
-To use one of these, you can use a different [datasource provider](https://www.prisma.io/docs/reference/api-reference/prisma-schema-reference#datasource) in your `schema.prisma` file, or a different [SessionStorage adapter package](https://github.com/Shopify/shopify-api-js/blob/main/packages/shopify-api/docs/guides/session-storage.md).
+---
 
-### Build
+## Webhooks: как обрабатываем
 
-Build the app by running the command below with the package manager of your choice:
+Поддерживаем topics:
+- `orders/create`
+- `orders/updated`
+- `orders/paid` (если включено)
+- `app/uninstalled`
 
-Using yarn:
+Пайплайн (упрощённо):
+1) `authenticate.webhook(request)` → `{ topic, shop, payload, admin }`
+2) normalize topic
+3) stable fields → `payloadHash`
+4) `computeRiskFromWebhookPayload(shop, payload, topic)`
+5) `upsertRiskIfChanged(...)`:
+   - если unchanged → записать trust-поля + decision=SKIPPED + skipReason=UNCHANGED
+   - если changed → update risk + trust-поля + decision=APPLIED
+6) если changed → Shopify side effects (tags + assessment)
 
-```shell
-yarn build
-```
+---
 
-Using npm:
+## Мультиязычность (i18n)
 
-```shell
-npm run build
-```
+- Язык определяется через query param `?lang=xx` (fallback на default).
+- `SUPPORTED_LANGS` — список языков (EN/DE/FR/ES и т.д.)
+- В UI все строки через `t(lang, "key")`.
+- Принцип: новые тексты добавляем **сразу** в словари.
 
-Using pnpm:
+---
 
-```shell
-pnpm run build
-```
+## Локальный запуск (dev)
 
-## Hosting
+Типовой сценарий (может отличаться от окружения):
+1) Установить зависимости:
+   - `npm install`
+2) Prisma:
+   - `npx prisma migrate dev`
+3) Shopify dev:
+   - `shopify app dev`
 
-When you're ready to set up your app in production, you can follow [our deployment documentation](https://shopify.dev/docs/apps/launch/deployment) to host it externally. From there, you have a few options:
+---
 
-- [Google Cloud Run](https://shopify.dev/docs/apps/launch/deployment/deploy-to-google-cloud-run): This tutorial is written specifically for this example repo, and is compatible with the extended steps included in the subsequent [**Build your app**](tutorial) in the **Getting started** docs. It is the most detailed tutorial for taking a React Router-based Shopify app and deploying it to production. It includes configuring permissions and secrets, setting up a production database, and even hosting your apps behind a load balancer across multiple regions.
-- [Fly.io](https://fly.io/docs/js/shopify/): Leverages the Fly.io CLI to quickly launch Shopify apps to a single machine.
-- [Render](https://render.com/docs/deploy-shopify-app): This tutorial guides you through using Docker to deploy and install apps on a Dev store.
-- [Manual deployment guide](https://shopify.dev/docs/apps/launch/deployment/deploy-to-hosting-service): This resource provides general guidance on the requirements of deployment including environment variables, secrets, and persistent data.
+## Политика данных (важно для Shopify)
 
-When you reach the step for [setting up environment variables](https://shopify.dev/docs/apps/deployment/web#set-env-vars), you also need to set the variable `NODE_ENV=production`.
+- В stable hash и UI **не тянем protected customer data** (email/phone/zip и т.д.) без необходимости.
+- В risk reasons держим либо коды, либо безопасные детали (без PII).
 
-## Gotchas / Troubleshooting
+---
 
-### Database tables don't exist
+## Что делает Shopify “с коробки” и где наше преимущество
 
-If you get an error like:
+Shopify показывает базовые fraud indicators/insights (типа CVV unavailable, IP info и т.п.).
+RiskMate отличается:
+- **ваши правила и ваши веса** (вместо “черного ящика”)
+- **автоматические сайд-эффекты** (теги/ассессмент/поток обработки)
+- **идемпотентность** + журналирование “почему SKIPPED”
+- **настраиваемый риск-скоринг** под конкретный бизнес
 
-```
-The table `main.Session` does not exist in the current database.
-```
+---
 
-Create the database for Prisma. Run the `setup` script in `package.json` using `npm`, `yarn` or `pnpm`.
+## Roadmap (следующие шаги)
 
-### Navigating/redirecting breaks an embedded app
+### E1 (сделано/в процессе)
+- i18n словари и перенос UI строк в `strings.ts`.
 
-Embedded apps must maintain the user session, which can be tricky inside an iFrame. To avoid issues:
+### E2 (в работе сейчас)
+- Tab Events: показывать последние события отдельно от Orders.
+  - В Events должна быть ссылка на заказ (Admin URL).
+  - В Orders убрать “Recent events” блок (или оставить мини trust-строки только в rows).
 
-1. Use `Link` from `react-router` or `@shopify/polaris`. Do not use `<a>`.
-2. Use `redirect` returned from `authenticate.admin`. Do not use `redirect` from `react-router`
-3. Use `useSubmit` from `react-router`.
+### E3 (следом)
+- “Event log” полноценно:
+  - модель `RiskEvent` (если ещё не добавлена/не стабилизирована),
+  - запись события на каждый webhook: `{topic, eventAt, payloadHash, decision, skipReason, riskLevelAfter, scoreAfter}`
+  - Events tab использует **RiskEvent**, а не `RiskResult`.
 
-This only applies if your app is embedded, which it will be by default.
+### E4
+- Улучшить “why skipped” причины:
+  - `DUPLICATE_EVENT`, `NO_RULES`, `IGNORED_TOPIC`, `HASH_UNCHANGED`, `ERROR_HANDLED`, etc.
 
-### Webhooks: shop-specific webhook subscriptions aren't updated
+### E5 (позже, но держим в плане)
+- Production hardening:
+  - rate limiting / защита webhook routes
+  - retries safety (Shopify expects 200)
+  - better logging (без PII)
+  - optional: экспорт/импорт rules
+  - optional: presets для ниш (clothing, electronics…)
 
-If you are registering webhooks in the `afterAuth` hook, using `shopify.registerWebhooks`, you may find that your subscriptions aren't being updated.
+---
 
-Instead of using the `afterAuth` hook declare app-specific webhooks in the `shopify.app.toml` file. This approach is easier since Shopify will automatically sync changes every time you run `deploy` (e.g: `npm run deploy`). Please read these guides to understand more:
+## Принципы разработки (важно)
 
-1. [app-specific vs shop-specific webhooks](https://shopify.dev/docs/apps/build/webhooks/subscribe#app-specific-subscriptions)
-2. [Create a subscription tutorial](https://shopify.dev/docs/apps/build/webhooks/subscribe/get-started?deliveryMethod=https)
+- “Deterministic first”: предсказуемость > магия.
+- “No protected data by default”.
+- Любое событие webhook должно оставлять след:
+  - **когда** пришло
+  - **что** было решено
+  - **почему** (decision + skipReason)
 
-If you do need shop-specific webhooks, keep in mind that the package calls `afterAuth` in 2 scenarios:
+---
 
-- After installing the app
-- When an access token expires
+## Notes для будущих сессий ChatGPT
 
-During normal development, the app won't need to re-authenticate most of the time, so shop-specific subscriptions aren't updated. To force your app to update the subscriptions, uninstall and reinstall the app. Revisiting the app will call the `afterAuth` hook.
-
-### Webhooks: Admin created webhook failing HMAC validation
-
-Webhooks subscriptions created in the [Shopify admin](https://help.shopify.com/en/manual/orders/notifications/webhooks) will fail HMAC validation. This is because the webhook payload is not signed with your app's secret key.
-
-The recommended solution is to use [app-specific webhooks](https://shopify.dev/docs/apps/build/webhooks/subscribe#app-specific-subscriptions) defined in your toml file instead. Test your webhooks by triggering events manually in the Shopify admin(e.g. Updating the product title to trigger a `PRODUCTS_UPDATE`).
-
-### Webhooks: Admin object undefined on webhook events triggered by the CLI
-
-When you trigger a webhook event using the Shopify CLI, the `admin` object will be `undefined`. This is because the CLI triggers an event with a valid, but non-existent, shop. The `admin` object is only available when the webhook is triggered by a shop that has installed the app. This is expected.
-
-Webhooks triggered by the CLI are intended for initial experimentation testing of your webhook configuration. For more information on how to test your webhooks, see the [Shopify CLI documentation](https://shopify.dev/docs/apps/tools/cli/commands#webhook-trigger).
-
-### Incorrect GraphQL Hints
-
-By default the [graphql.vscode-graphql](https://marketplace.visualstudio.com/items?itemName=GraphQL.vscode-graphql) extension for will assume that GraphQL queries or mutations are for the [Shopify Admin API](https://shopify.dev/docs/api/admin). This is a sensible default, but it may not be true if:
-
-1. You use another Shopify API such as the storefront API.
-2. You use a third party GraphQL API.
-
-If so, please update [.graphqlrc.ts](https://github.com/Shopify/shopify-app-template-react-router/blob/main/.graphqlrc.ts).
-
-### Using Defer & await for streaming responses
-
-By default the CLI uses a cloudflare tunnel. Unfortunately cloudflare tunnels wait for the Response stream to finish, then sends one chunk. This will not affect production.
-
-To test [streaming using await](https://reactrouter.com/api/components/Await#await) during local development we recommend [localhost based development](https://shopify.dev/docs/apps/build/cli-for-apps/networking-options#localhost-based-development).
-
-### "nbf" claim timestamp check failed
-
-This is because a JWT token is expired. If you are consistently getting this error, it could be that the clock on your machine is not in sync with the server. To fix this ensure you have enabled "Set time and date automatically" in the "Date and Time" settings on your computer.
-
-### Using MongoDB and Prisma
-
-If you choose to use MongoDB with Prisma, there are some gotchas in Prisma's MongoDB support to be aware of. Please see the [Prisma SessionStorage README](https://www.npmjs.com/package/@shopify/shopify-app-session-storage-prisma#mongodb).
-
-### Unable to require(`C:\...\query_engine-windows.dll.node`).
-
-Unable to require(`C:\...\query_engine-windows.dll.node`).
-The Prisma engines do not seem to be compatible with your system.
-
-query_engine-windows.dll.node is not a valid Win32 application.
-
-**Fix:** Set the environment variable:
-
-```shell
-PRISMA_CLIENT_ENGINE_TYPE=binary
-```
-
-This forces Prisma to use the binary engine mode, which runs the query engine as a separate process and can work via emulation on Windows ARM64.
-
-## Resources
-
-React Router:
-
-- [React Router docs](https://reactrouter.com/home)
-
-Shopify:
-
-- [Intro to Shopify apps](https://shopify.dev/docs/apps/getting-started)
-- [Shopify App React Router docs](https://shopify.dev/docs/api/shopify-app-react-router)
-- [Shopify CLI](https://shopify.dev/docs/apps/tools/cli)
-- [Shopify App Bridge](https://shopify.dev/docs/api/app-bridge-library).
-- [Polaris Web Components](https://shopify.dev/docs/api/app-home/polaris-web-components).
-- [App extensions](https://shopify.dev/docs/apps/app-extensions/list)
-- [Shopify Functions](https://shopify.dev/docs/api/functions)
-
-Internationalization:
-
-- [Internationalizing your app](https://shopify.dev/docs/apps/best-practices/internationalization/getting-started)
+Если ты (Stanislav) кидаешь мне ссылку на репо и этот README — я должен:
+1) Прочитать “Что уже сделано” и “Roadmap”
+2) Спросить только если реально не хватает данных
+3) Давать патчи строго под текущие файлы/пути и стиль проекта
