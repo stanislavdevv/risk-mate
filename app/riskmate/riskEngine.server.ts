@@ -199,3 +199,82 @@ export async function computeRiskFromWebhookPayload(
     rulesVersion,
   };
 }
+
+export async function computeRiskFromSnapshot(
+  shop: string,
+  snapshot: {
+    total?: number | string | null;
+    qty?: number | string | null;
+    shippingCountry?: string | null;
+    billingCountry?: string | null;
+    customerOrdersCount?: number | null;
+  }
+) {
+  const rules = await prisma.riskRule.findMany({
+    where: { shop, status: "ACTIVE" },
+    orderBy: { createdAt: "asc" },
+  });
+  const rulesVersion = computeRulesVersion(rules);
+  const enabledRules = rules.filter((rule) => rule.enabled);
+
+  const orderTotal = Number(snapshot?.total ?? 0);
+  const quantity = Number(snapshot?.qty ?? 0);
+  const ordersCount = snapshot?.customerOrdersCount;
+  const isFirstOrder = ordersCount === 0 || ordersCount === 1;
+  const shippingCountry = snapshot?.shippingCountry ?? undefined;
+  const billingCountry = snapshot?.billingCountry ?? undefined;
+
+  const base = evaluateRules(enabledRules, {
+    orderTotal,
+    quantity,
+    isFirstOrder,
+    shippingCountry,
+    billingCountry,
+  } as any) as any;
+
+  const rawScore = Number(base?.score ?? 0);
+  const score = clampScore(rawScore);
+  const reasons = sanitizeFactors(Array.isArray(base?.factors) ? base.factors : []);
+  const actions: string[] = Array.isArray(base?.actions) ? base.actions.map(String) : [];
+
+  const riskLevel = calculateRiskLevel(score);
+  const decision = decisionFromRiskLevel(riskLevel);
+  const policy = deriveMvpPolicyTags(riskLevel);
+
+  const tags = new Set<string>();
+  tags.add("risk-mate");
+  tags.add(`risk:${riskLevel.toLowerCase()}`);
+
+  const wantReview = actions.some((a) => normalizeAction(a) === "REVIEW");
+  const wantHold = actions.some((a) => normalizeAction(a) === "HOLD");
+
+  if (policy.review && wantReview) tags.add("risk_review");
+  if (policy.hold && wantHold) tags.add("risk_hold");
+
+  const facts =
+    reasons.length > 0
+      ? Array.from(new Set(reasons.map((r) => r.label)))
+          .slice(0, MAX_FACTS)
+          .map((label) => ({
+            description: `[RiskMate] ${label}`,
+            sentiment: "NEGATIVE" as const,
+          }))
+      : [{ description: "[RiskMate] No rules matched.", sentiment: "NEUTRAL" as const }];
+
+  const reasonsPayload = {
+    summary: reasons.length > 0 ? "Rule matches" : "No rules matched",
+    factors: reasons,
+  };
+
+  return {
+    score,
+    riskLevel,
+    decision,
+    reasons,
+    reasonsJson: safeJson(reasonsPayload),
+    actions,
+    tags: Array.from(tags),
+    facts,
+    rulesVersion,
+  };
+}
