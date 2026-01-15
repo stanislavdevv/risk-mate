@@ -108,6 +108,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
 
   const hasRules = rules.length > 0;
   const hasChecks = items.length > 0;
+  const toIso = (d: Date | null | undefined) => (d ? d.toISOString() : null);
 
   return {
     shop: session.shop,
@@ -130,24 +131,34 @@ export async function loader({ request }: LoaderFunctionArgs) {
       }),
     ),
 
-    // ✅ events теперь сразу содержат ссылку на заказ
-    events: events.map(
-      (e): RiskEventRow => {
-        const orderId = orderIdFromGid(e.orderGid);
-        const orderAdminUrl = orderId ? shopifyAdminOrderUrl(session.shop, orderId) : null;
+   events: events.map(
+  (e): RiskEventRow => {
+    const orderId = orderIdFromGid(e.orderGid);
+    const orderAdminUrl = orderId ? shopifyAdminOrderUrl(session.shop, orderId) : null;
+    console.log(e.createdAt);
 
-        return {
-          id: e.id,
-          orderGid: e.orderGid,
-          orderName: e.orderName,
-          topic: e.topic,
-          eventAt: e.eventAt.toISOString(),
-          decision: e.decision ?? null,
-          skipReason: e.skipReason ?? null,
-          orderAdminUrl,
-        };
-      },
-    ),
+    const timeIso = e.createdAt ? e.createdAt.toISOString() : null;
+
+    return {
+      id: e.id,
+      orderGid: e.orderGid,
+
+      // UI обычно ждёт orderName — оставим, но берём из orderNumber
+      orderName: (e as any).orderNumber ?? null,
+
+      topic: e.topic,
+
+      // оставляем для совместимости/других мест
+      eventAt: timeIso,
+
+      decision: e.decision ?? null,
+      skipReason: (e as any)?.reasons?.summary ?? null,
+      orderAdminUrl,
+    };
+  },
+),
+
+
 
     rows: items.map(
       (it): Row => {
@@ -217,16 +228,16 @@ export async function action({ request }: ActionFunctionArgs) {
       action: string | null;
       enabled: boolean;
     }> = [
-      { type: "ORDER_VALUE", operator: ">=", value: "300", points: 15, action: "REVIEW", enabled: true },
-      { type: "ORDER_VALUE", operator: ">=", value: "500", points: 25, action: "HOLD", enabled: true },
+        { type: "ORDER_VALUE", operator: ">=", value: "300", points: 15, action: "REVIEW", enabled: true },
+        { type: "ORDER_VALUE", operator: ">=", value: "500", points: 25, action: "HOLD", enabled: true },
 
-      { type: "FIRST_TIME", operator: "=", value: "true", points: 10, action: "REVIEW", enabled: true },
+        { type: "FIRST_TIME", operator: "=", value: "true", points: 10, action: "REVIEW", enabled: true },
 
-      { type: "HIGH_QTY", operator: ">=", value: "5", points: 10, action: "REVIEW", enabled: true },
-      { type: "HIGH_QTY", operator: ">=", value: "10", points: 20, action: "HOLD", enabled: true },
+        { type: "HIGH_QTY", operator: ">=", value: "5", points: 10, action: "REVIEW", enabled: true },
+        { type: "HIGH_QTY", operator: ">=", value: "10", points: 20, action: "HOLD", enabled: true },
 
-      { type: "COUNTRY_MISMATCH", operator: "=", value: "true", points: 15, action: "HOLD", enabled: true },
-    ];
+        { type: "COUNTRY_MISMATCH", operator: "=", value: "true", points: 15, action: "HOLD", enabled: true },
+      ];
 
     const created = await prisma.$transaction(
       defaults.map((d) =>
