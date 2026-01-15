@@ -140,12 +140,18 @@ export async function computeRiskFromWebhookPayload(
   // 5) Facts for assessment (short + safe)
   const facts =
     reasons.length > 0
-      ? reasons.slice(0, MAX_FACTS).map((r: any) => ({
-          description: `[RiskMate] ${
-            typeof r === "string" ? r : typeof r?.code === "string" ? r.code : "RULE_MATCH"
-          }`,
-          sentiment: "NEGATIVE" as const,
-        }))
+      ? Array.from(
+          new Set(
+            reasons.map((r: any) =>
+              typeof r === "string" ? r : typeof r?.code === "string" ? r.code : "RULE_MATCH"
+            )
+          )
+        )
+          .slice(0, MAX_FACTS)
+          .map((code) => ({
+            description: `[RiskMate] ${code}`,
+            sentiment: "NEGATIVE" as const,
+          }))
       : [{ description: "[RiskMate] No rules matched.", sentiment: "NEUTRAL" as const }];
 
   return {
