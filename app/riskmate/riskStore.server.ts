@@ -13,9 +13,6 @@ export async function upsertRiskIfChanged(input: {
   payloadHash: string;
   lastTopic: string;
   lastEventAt: Date;
-
-  // decision context
-  skipReasonIfUnchanged?: string; // default: "UNCHANGED"
 }): Promise<{ skipped: boolean }> {
   const existing = await prisma.riskResult.findUnique({
     where: { shop_orderGid: { shop: input.shop, orderGid: input.orderGid } },
@@ -27,7 +24,7 @@ export async function upsertRiskIfChanged(input: {
 
   const unchangedByHash = !!existing && (existing.payloadHash ?? "") === (input.payloadHash ?? "");
 
-  // ✅ always update trust fields + decision
+  // ✅ always update trust fields
   if (unchangedByHash) {
     await prisma.riskResult.update({
       where: { shop_orderGid: { shop: input.shop, orderGid: input.orderGid } },
@@ -38,10 +35,6 @@ export async function upsertRiskIfChanged(input: {
         lastTopic: input.lastTopic,
         lastEventAt: input.lastEventAt,
         eventCount: { increment: 1 },
-
-        // decision
-        lastDecision: "SKIPPED",
-        skipReason: input.skipReasonIfUnchanged ?? "UNCHANGED",
       },
     });
 
@@ -66,10 +59,6 @@ export async function upsertRiskIfChanged(input: {
       lastEventAt: input.lastEventAt,
       eventCount: 1,
 
-      // decision
-      lastDecision: "APPLIED",
-      skipReason: null,
-
       // ✅ risk changed (first time is also a change)
       lastRiskChangeAt: now,
     },
@@ -84,10 +73,6 @@ export async function upsertRiskIfChanged(input: {
       lastTopic: input.lastTopic,
       lastEventAt: input.lastEventAt,
       eventCount: { increment: 1 },
-
-      // decision
-      lastDecision: "APPLIED",
-      skipReason: null,
 
       // ✅ changed
       lastRiskChangeAt: now,

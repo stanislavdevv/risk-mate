@@ -135,7 +135,7 @@ export async function action({ request }: ActionFunctionArgs) {
     // ---- out-of-order guard ----
     const existing = await prisma.riskResult.findUnique({
       where: { shop_orderGid: { shop, orderGid } },
-      select: { lastEventAt: true },
+      select: { lastEventAt: true, riskLevel: true },
     });
 
     if (existing?.lastEventAt && existing.lastEventAt.getTime() > eventAt.getTime()) {
@@ -146,12 +146,9 @@ export async function action({ request }: ActionFunctionArgs) {
           lastTopic: t,
           lastEventAt: eventAt,
           eventCount: { increment: 1 },
-          lastDecision: "SKIPPED",
-          skipReason: "OUT_OF_ORDER",
           orderName: orderName ?? "",
         },
       });
-
 
       // still append RiskEvent (central log)
       const source = topicToSource(t);

@@ -49,6 +49,9 @@ export const STRINGS: Dictionaries = {
 
         riskChanged: "Risk changed",
         decision: "Decision",
+        skipped: "Skipped",
+        skippedTooltipUnchanged: "No meaningful order changes detected",
+        skippedTooltipGeneric: "Skipped: {reason}",
 
         rulesTitle: "Rules",
         rulesSubtitle: "Inline edit · thresholds are in",
@@ -126,6 +129,9 @@ export const STRINGS: Dictionaries = {
 
         riskChanged: "Risiko geändert",
         decision: "Entscheidung",
+        skipped: "Übersprungen",
+        skippedTooltipUnchanged: "Keine bedeutenden Bestelländerungen erkannt",
+        skippedTooltipGeneric: "Übersprungen: {reason}",
 
         rulesTitle: "Regeln",
         rulesSubtitle: "Inline-Edit · Schwellenwerte in",
@@ -202,6 +208,9 @@ export const STRINGS: Dictionaries = {
 
         riskChanged: "Riesgo cambió",
         decision: "Decisión",
+        skipped: "Omitido",
+        skippedTooltipUnchanged: "No se detectaron cambios significativos en el pedido",
+        skippedTooltipGeneric: "Omitido: {reason}",
 
         rulesTitle: "Reglas",
         rulesSubtitle: "Edición inline · umbrales en",
@@ -278,6 +287,9 @@ export const STRINGS: Dictionaries = {
 
         riskChanged: "Risque modifié",
         decision: "Décision",
+        skipped: "Ignoré",
+        skippedTooltipUnchanged: "Aucun changement significatif de commande détecté",
+        skippedTooltipGeneric: "Ignoré : {reason}",
 
         rulesTitle: "Règles",
         rulesSubtitle: "Édition inline · seuils en",
@@ -355,6 +367,9 @@ export const STRINGS: Dictionaries = {
 
         riskChanged: "Risk changed",
         decision: "Decision",
+        skipped: "Пропущено",
+        skippedTooltipUnchanged: "Нет значимых изменений заказа",
+        skippedTooltipGeneric: "Пропущено: {reason}",
 
         rulesTitle: "Rules",
         rulesSubtitle: "Inline edit · thresholds are in",
