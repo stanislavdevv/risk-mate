@@ -3,6 +3,7 @@ import { evaluateRules } from "./rules.engine";
 import { calculateRiskLevel } from "./riskLevel";
 import type { RiskLevel } from "./types";
 import { decisionFromRiskLevel, type Decision } from "./decision";
+import { computeRulesVersion } from "./rulesetVersion.server";
 
 const SCORE_MIN = 0;
 const SCORE_MAX = 100;
@@ -78,11 +79,14 @@ export async function computeRiskFromWebhookPayload(
   actions: string[];
   tags: string[]; // keep for compatibility, but MVP-minimal
   facts: { description: string; sentiment: "NEGATIVE" | "NEUTRAL" | "POSITIVE" }[];
+  rulesVersion: string;
 }> {
   const rules = await prisma.riskRule.findMany({
-    where: { shop, enabled: true },
+    where: { shop },
     orderBy: { createdAt: "asc" },
   });
+  const rulesVersion = computeRulesVersion(rules);
+  const enabledRules = rules.filter((rule) => rule.enabled);
 
   const orderTotal = Number((payload as any)?.current_total_price ?? 0);
 
@@ -97,7 +101,7 @@ export async function computeRiskFromWebhookPayload(
   const shippingCountry = (payload as any)?.shipping_address?.country_code as string | undefined;
   const billingCountry = (payload as any)?.billing_address?.country_code as string | undefined;
 
-  const base = evaluateRules(rules, {
+  const base = evaluateRules(enabledRules, {
     orderTotal,
     quantity,
     isFirstOrder,
@@ -163,5 +167,6 @@ export async function computeRiskFromWebhookPayload(
     actions,
     tags: Array.from(tags),
     facts,
+    rulesVersion,
   };
 }
