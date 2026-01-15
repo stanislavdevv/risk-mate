@@ -1,5 +1,5 @@
 import prisma from "../db.server";
-import { evaluateRules } from "./rules.engine";
+import { evaluateRules, type RuleFactor } from "./rules.engine";
 import { calculateRiskLevel } from "./riskLevel";
 import type { RiskLevel } from "./types";
 import { decisionFromRiskLevel, type Decision } from "./decision";
@@ -27,27 +27,57 @@ function normalizeAction(s: any) {
   return String(s ?? "").trim().toUpperCase();
 }
 
-function sanitizeReasons(input: any[]): any[] {
+function sanitizeFactors(input: any[]): RuleFactor[] {
   const arr = Array.isArray(input) ? input : [];
-  const out: any[] = [];
+  const out: RuleFactor[] = [];
 
   for (const r of arr) {
     if (out.length >= MAX_REASONS) break;
 
-    // allow strings like "ORDER_VALUE"
-    if (typeof r === "string") {
-      out.push(r.slice(0, 120));
+    if (r && typeof r === "object" && typeof r.ruleKey === "string") {
+      const label = typeof r.label === "string" ? r.label.slice(0, 120) : "RULE";
+      const description =
+        typeof r.description === "string" ? r.description.slice(0, 200) : label;
+      const weight = Number.isFinite(r.weight) ? Math.trunc(r.weight) : 0;
+      const evidence = r.evidence && typeof r.evidence === "object" ? r.evidence : {};
+
+      const ruleType = typeof r.ruleType === "string" ? r.ruleType : label;
+      const operator = typeof r.operator === "string" ? r.operator : "";
+      const value = typeof r.value === "string" ? r.value : "";
+      const action = typeof r.action === "string" ? r.action : null;
+      const status = typeof r.status === "string" ? r.status : "";
+
+      out.push({
+        type: "RULE",
+        label,
+        description,
+        ruleKey: String(r.ruleKey),
+        weight,
+        evidence,
+        ruleType,
+        operator,
+        value,
+        action,
+        status,
+      });
       continue;
     }
 
-    // allow {code, details} but clamp length
-    if (r && typeof r === "object") {
-      const code = typeof (r as any).code === "string" ? (r as any).code.slice(0, 60) : "REASON";
-      const details =
-        typeof (r as any).details === "string" ? (r as any).details.slice(0, 200) : undefined;
-
-      out.push(details ? { code, details } : { code });
-      continue;
+    if (typeof r === "string") {
+      const text = r.slice(0, 120);
+      out.push({
+        type: "RULE",
+        label: text,
+        description: text,
+        ruleKey: `legacy:${text}`,
+        weight: 0,
+        evidence: {},
+        ruleType: text,
+        operator: "",
+        value: "",
+        action: null,
+        status: "",
+      });
     }
   }
 
@@ -74,7 +104,7 @@ export async function computeRiskFromWebhookPayload(
   score: number;
   riskLevel: RiskLevel;
   decision: Decision | null;
-  reasons: any[];
+  reasons: RuleFactor[];
   reasonsJson: string;
   actions: string[];
   tags: string[]; // keep for compatibility, but MVP-minimal
@@ -115,7 +145,7 @@ export async function computeRiskFromWebhookPayload(
   const score = clampScore(rawScore);
 
   // 2) Sanitize reasons & actions
-  const reasons = sanitizeReasons(Array.isArray(base?.reasons) ? base.reasons : []);
+  const reasons = sanitizeFactors(Array.isArray(base?.factors) ? base.factors : []);
   const actions: string[] = Array.isArray(base?.actions) ? base.actions.map(String) : [];
 
   // 3) Risk level is derived ONLY from score (policy source of truth)
@@ -144,26 +174,25 @@ export async function computeRiskFromWebhookPayload(
   // 5) Facts for assessment (short + safe)
   const facts =
     reasons.length > 0
-      ? Array.from(
-          new Set(
-            reasons.map((r: any) =>
-              typeof r === "string" ? r : typeof r?.code === "string" ? r.code : "RULE_MATCH"
-            )
-          )
-        )
+      ? Array.from(new Set(reasons.map((r) => r.label)))
           .slice(0, MAX_FACTS)
-          .map((code) => ({
-            description: `[RiskMate] ${code}`,
+          .map((label) => ({
+            description: `[RiskMate] ${label}`,
             sentiment: "NEGATIVE" as const,
           }))
       : [{ description: "[RiskMate] No rules matched.", sentiment: "NEUTRAL" as const }];
+
+  const reasonsPayload = {
+    summary: reasons.length > 0 ? "Rule matches" : "No rules matched",
+    factors: reasons,
+  };
 
   return {
     score,
     riskLevel,
     decision,
     reasons,
-    reasonsJson: safeJson(reasons),
+    reasonsJson: safeJson(reasonsPayload),
     actions,
     tags: Array.from(tags),
     facts,

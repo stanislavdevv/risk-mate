@@ -615,6 +615,8 @@ export default function AppIndex() {
 
   const tab = (params.get("tab") ?? "orders").toLowerCase();
   const level = (params.get("level") ?? "ALL").toUpperCase();
+  const focusedRuleId = params.get("ruleId");
+  const [openFactorId, setOpenFactorId] = useState<string | null>(null);
 
   type Tab = "orders" | "rules" | "events";
 
@@ -768,12 +770,37 @@ export default function AppIndex() {
                         <td style={td}>
                           {Array.isArray(r.reasons) && r.reasons.length ? (
                             <ul style={{ margin: 0, paddingLeft: 18 }}>
-                              {r.reasons.slice(0, 3).map((x: any, i: number) => (
-                                <li key={i}>
-                                  <code style={codeInline}>{formatReasonLabel(x, lang)}</code>
-                                  {typeof x === "object" && x.details ? ` — ${x.details}` : ""}
-                                </li>
-                              ))}
+                              {r.reasons.slice(0, 3).map((x: any, i: number) => {
+                                const label = formatReasonLabel(x, lang);
+                                const ruleKey = reasonRuleKey(x);
+                                const factorId = `${r.id}:${i}`;
+                                const lines = factorPopoverLines(x, lang);
+                                return (
+                                  <li key={i} style={{ position: "relative" }}>
+                                    <span
+                                      style={popoverTrigger}
+                                      tabIndex={0}
+                                      onClick={() =>
+                                        setOpenFactorId(openFactorId === factorId ? null : factorId)
+                                      }
+                                      onBlur={() => {
+                                        window.setTimeout(() => setOpenFactorId(null), 0);
+                                      }}
+                                    >
+                                      <code style={codeInline}>{label}</code>
+                                    </span>
+                                    {openFactorId === factorId && ruleKey ? (
+                                      <div style={popoverCard}>
+                                        {lines.map((line) => (
+                                          <div key={line} style={popoverLine}>
+                                            {line}
+                                          </div>
+                                        ))}
+                                      </div>
+                                    ) : null}
+                                  </li>
+                                );
+                              })}
                               {r.reasons.length > 3 ? <li>…</li> : null}
                             </ul>
                           ) : (
@@ -799,7 +826,7 @@ export default function AppIndex() {
           </section>
         </>
       ) : tab === "rules" ? (
-        <RulesInline data={data} lang={lang} />
+        <RulesInline data={data} lang={lang} focusedRuleId={focusedRuleId} />
       ) : (
         <EventsTab data={data} lang={lang} />
       )}
@@ -809,7 +836,15 @@ export default function AppIndex() {
 
 /* ---------- Rules inline editor ---------- */
 
-function RulesInline({ data, lang }: { data: LoaderData; lang: Lang }) {
+function RulesInline({
+  data,
+  lang,
+  focusedRuleId,
+}: {
+  data: LoaderData;
+  lang: Lang;
+  focusedRuleId: string | null;
+}) {
   const [localRules, setLocalRules] = useState<Rule[]>(data.rules);
   useEffect(() => setLocalRules(data.rules), [data.rules]);
 
@@ -832,6 +867,14 @@ function RulesInline({ data, lang }: { data: LoaderData; lang: Lang }) {
   const [ruleHistory, setRuleHistory] = useState<RuleChange[]>(data.ruleChanges ?? []);
   const [hasMoreHistory, setHasMoreHistory] = useState<boolean>(Boolean(data.hasMoreRuleChanges));
   const historyFetcher = useFetcher<ActionData>();
+
+  useEffect(() => {
+    if (!focusedRuleId) return;
+    const el = document.getElementById(`rule-${focusedRuleId}`);
+    if (el) {
+      el.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+  }, [focusedRuleId, localRules]);
 
   const [ui, setUi] = useState<{ state: "idle" | "saving" | "saved" | "error"; msg?: string }>({ state: "idle" });
 
@@ -1032,7 +1075,7 @@ function RulesInline({ data, lang }: { data: LoaderData; lang: Lang }) {
 
             <tbody>
               {localRules.map((r) => (
-                <tr key={r.id}>
+                <tr key={r.id} id={`rule-${r.id}`} style={focusedRuleId === r.id ? ruleFocusRow : undefined}>
                   <td style={td}>
                     <button
                       type="button"
@@ -1432,7 +1475,9 @@ function json<T>(obj: T, status = 200) {
 function safeJsonParse(s: string) {
   try {
     const v = JSON.parse(s);
-    return Array.isArray(v) ? v : [];
+    if (Array.isArray(v)) return v;
+    if (v && typeof v === "object" && Array.isArray((v as any).factors)) return (v as any).factors;
+    return [];
   } catch {
     return [];
   }
@@ -1455,9 +1500,7 @@ function extractReasonsArray(reasons: any) {
   if (!reasons || typeof reasons !== "object") return null;
   if (Array.isArray(reasons)) return reasons;
   if (Array.isArray((reasons as any).factors)) {
-    return (reasons as any).factors
-      .map((f: any) => (typeof f?.label === "string" ? f.label : null))
-      .filter((x: string | null) => x);
+    return (reasons as any).factors;
   }
   return null;
 }
@@ -1482,10 +1525,53 @@ function ruleStatusLabel(lang: Lang, status: RuleStatus) {
 
 function formatReasonLabel(reason: any, lang: Lang) {
   if (typeof reason === "string") return ruleTypeLabel(lang, reason as RuleType);
+  if (reason && typeof reason === "object" && typeof reason.label === "string") {
+    return ruleTypeLabel(lang, reason.label as RuleType);
+  }
   if (reason && typeof reason === "object" && typeof reason.code === "string") {
     return ruleTypeLabel(lang, reason.code as RuleType);
   }
   return t(lang, "reasonFallback");
+}
+
+function reasonRuleKey(reason: any) {
+  if (reason && typeof reason === "object" && typeof reason.ruleKey === "string") {
+    if (reason.ruleKey.startsWith("legacy:")) return null;
+    return reason.ruleKey;
+  }
+  return null;
+}
+
+function factorRuleInfo(reason: any) {
+  if (!reason || typeof reason !== "object") return null;
+  const ruleKey = reasonRuleKey(reason);
+  if (!ruleKey) return null;
+  return {
+    ruleKey,
+    ruleType: typeof reason.ruleType === "string" ? reason.ruleType : "",
+    operator: typeof reason.operator === "string" ? reason.operator : "",
+    value: typeof reason.value === "string" ? reason.value : "",
+    weight: Number.isFinite(reason.weight) ? String(reason.weight) : "",
+    action: typeof reason.action === "string" ? reason.action : "",
+    status: typeof reason.status === "string" ? reason.status : "",
+  };
+}
+
+function factorPopoverLines(reason: any, lang: Lang) {
+  const info = factorRuleInfo(reason);
+  if (!info) return [];
+  const threshold = info.operator && info.value ? `${info.operator} ${info.value}` : t(lang, "emptyValue");
+  const status = info.status ? ruleStatusLabel(lang, info.status as RuleStatus) : t(lang, "emptyValue");
+  const action = info.action ? info.action : t(lang, "emptyValue");
+  const typeLabel = info.ruleType ? ruleTypeLabel(lang, info.ruleType as RuleType) : t(lang, "emptyValue");
+  return [
+    `${t(lang, "ruleLabel")}: ${info.ruleKey}`,
+    `${t(lang, "type")}: ${typeLabel}`,
+    `${t(lang, "status")}: ${status}`,
+    `${t(lang, "threshold")}: ${threshold}`,
+    `${t(lang, "points")}: ${info.weight || t(lang, "emptyValue")}`,
+    `${t(lang, "action")}: ${action}`,
+  ];
 }
 
 function riskLevelLabel(lang: Lang, level: Row["riskLevel"]) {
@@ -1503,6 +1589,17 @@ function decisionLabel(lang: Lang, decision: string) {
 
 function formatRuleChangeSummary(entry: RuleChange, lang: Lang) {
   if (!entry.changes.length) return t(lang, "noChangeDetails");
+
+  const created = entry.changes.find((c) => c.field === "created");
+  if (created) {
+    return `${t(lang, "change_created")} ${t(lang, "change_rule")}`;
+  }
+
+  const deleted = entry.changes.find((c) => c.field === "deleted");
+  if (deleted) {
+    return `${t(lang, "change_deleted")} ${t(lang, "change_rule")}`;
+  }
+
   const parts = entry.changes.map((change) => {
     const fieldLabel = t(lang, `change_${change.field}`);
     const from = formatChangeValue(change.from, lang);
@@ -1719,6 +1816,32 @@ const codeInline: React.CSSProperties = {
   border: "1px solid #edf0f2",
 };
 
+const popoverTrigger: React.CSSProperties = {
+  display: "inline-flex",
+  alignItems: "center",
+  cursor: "pointer",
+};
+
+const popoverCard: React.CSSProperties = {
+  position: "absolute",
+  top: "100%",
+  left: 0,
+  marginTop: 6,
+  zIndex: 20,
+  background: "#ffffff",
+  border: "1px solid #dfe3e8",
+  borderRadius: 10,
+  padding: "8px 10px",
+  boxShadow: "0 8px 20px rgba(32,34,35,0.12)",
+  minWidth: 240,
+};
+
+const popoverLine: React.CSSProperties = {
+  fontSize: 12,
+  color: "#202223",
+  padding: "2px 0",
+};
+
 const decisionInline: React.CSSProperties = {
   display: "inline-flex",
   alignItems: "center",
@@ -1829,6 +1952,10 @@ const cardInner: React.CSSProperties = {
   borderRadius: 16,
   padding: 14,
   background: "#ffffff",
+};
+
+const ruleFocusRow: React.CSSProperties = {
+  background: "#fff5ea",
 };
 
 const label: React.CSSProperties = {
