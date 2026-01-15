@@ -4,7 +4,7 @@ import prisma from "../db.server";
 
 type RulesetRule = Pick<RiskRule, "type" | "enabled" | "operator" | "value" | "points" | "action" | "status">;
 
-type CanonicalRule = {
+export type RulesetSnapshotRule = {
   ruleKey: string;
   enabled: boolean;
   params: { operator: string; value: string };
@@ -12,7 +12,7 @@ type CanonicalRule = {
   action: string | null;
 };
 
-function canonicalizeRuleset(rules: RulesetRule[]): CanonicalRule[] {
+function canonicalizeRuleset(rules: RulesetRule[]): RulesetSnapshotRule[] {
   const normalized = rules.map((rule) => ({
     ruleKey: String(rule.type ?? ""),
     enabled: Boolean(rule.enabled),
@@ -47,6 +47,10 @@ function canonicalizeRuleset(rules: RulesetRule[]): CanonicalRule[] {
   return normalized;
 }
 
+export function buildRulesetSnapshot(rules: RulesetRule[]): RulesetSnapshotRule[] {
+  return canonicalizeRuleset(rules);
+}
+
 export function computeRulesVersion(rules: RulesetRule[]): string {
   const canonical = canonicalizeRuleset(rules);
   const payload = JSON.stringify(canonical);
@@ -59,4 +63,12 @@ export async function getCurrentRulesVersion(shop: string): Promise<string> {
     orderBy: { createdAt: "asc" },
   });
   return computeRulesVersion(rules);
+}
+
+export async function getCurrentRulesetSnapshot(shop: string): Promise<RulesetSnapshotRule[]> {
+  const rules = await prisma.riskRule.findMany({
+    where: { shop, status: "ACTIVE" },
+    orderBy: { createdAt: "asc" },
+  });
+  return buildRulesetSnapshot(rules);
 }

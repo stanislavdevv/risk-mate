@@ -6,6 +6,7 @@ import prisma from "../db.server";
 import { authenticate } from "../shopify.server";
 import { SUPPORTED_LANGS, type Lang, t, parseLang } from "../i18n/strings";
 import { computeRulesVersion } from "../riskmate/rulesetVersion.server";
+import { computeRiskFromSnapshot } from "../riskmate/riskEngine.server";
 
 /* ---------- types ---------- */
 
@@ -43,6 +44,8 @@ type RiskEventRow = {
   decision: string | null;
   skipReason: string | null;
   orderAdminUrl: string | null; // ✅ добавили ссылку
+  rulesVersion: string | null;
+  rulesSnapshot: any[] | null;
 };
 
 type Row = {
@@ -56,6 +59,7 @@ type Row = {
   updatedAt: string;
   orderAdminUrl: string | null;
   rulesVersion: string | null;
+  rulesSnapshot: any[] | null;
 
   // trust
   lastTopic: string | null;
@@ -75,7 +79,25 @@ type ActionData =
   | { ok: true; op: "toggleRule"; id: string; enabled: boolean }
   | { ok: true; op: "deleteRule"; id: string }
   | { ok: true; op: "loadRuleHistory"; items: RuleChange[]; hasMore: boolean }
+  | {
+      ok: true;
+      op: "simulate";
+      orderGid: string;
+      current: { decision: string; score: number; factors: SimFactor[] };
+      simulated: { decision: string; score: number; factors: SimFactor[] };
+      diff: {
+        scoreDiff: number;
+        added: SimFactor[];
+        removed: SimFactor[];
+      };
+    }
   | { ok: false; error: string };
+
+type SimFactor = {
+  ruleKey: string;
+  label: string;
+  ruleType: string;
+};
 
 /* ---------- loader ---------- */
 
@@ -127,7 +149,13 @@ export async function loader({ request }: LoaderFunctionArgs) {
   const orderGids = items.map((it) => it.orderGid);
   const latestEventsByOrder = new Map<
     string,
-    { decision: string | null; skipReason: string | null; reasonsJson: string | null; rulesVersion: string | null }
+    {
+      decision: string | null;
+      skipReason: string | null;
+      reasonsJson: string | null;
+      rulesVersion: string | null;
+      rulesSnapshot: any[] | null;
+    }
   >();
 
   if (orderGids.length > 0) {
@@ -145,6 +173,9 @@ export async function loader({ request }: LoaderFunctionArgs) {
           skipReason: skipReason ?? normalizeSkipReason((event as any).skipReason) ?? null,
           reasonsJson: reasonsFromEvent ? JSON.stringify(reasonsFromEvent) : (event as any).reasonsJson ?? null,
           rulesVersion: (event as any).rulesVersion ?? null,
+          rulesSnapshot: Array.isArray((event as any).rulesSnapshot)
+            ? ((event as any).rulesSnapshot as any[])
+            : null,
         });
       }
     }
@@ -153,8 +184,9 @@ export async function loader({ request }: LoaderFunctionArgs) {
   // recent events (if model exists)
   let events: any[] = [];
   try {
+    const eventWhere: any = { shop: session.shop };
     events = await prisma.riskEvent.findMany({
-      where: { shop: session.shop },
+      where: eventWhere,
       orderBy: { createdAt: "desc" },
       take: 20,
     });
@@ -191,34 +223,36 @@ export async function loader({ request }: LoaderFunctionArgs) {
       }),
     ),
 
-   events: events.map(
-  (e): RiskEventRow => {
-    const orderId = orderIdFromGid(e.orderGid);
-    const orderAdminUrl = orderId ? shopifyAdminOrderUrl(session.shop, orderId) : null;
+    events: events.map(
+      (e): RiskEventRow => {
+        const orderId = orderIdFromGid(e.orderGid);
+        const orderAdminUrl = orderId ? shopifyAdminOrderUrl(session.shop, orderId) : null;
 
-    const timeIso = e.createdAt ? e.createdAt.toISOString() : null;
+        const timeIso = e.createdAt ? e.createdAt.toISOString() : null;
 
-    return {
-      id: e.id,
-      orderGid: e.orderGid,
+        return {
+          id: e.id,
+          orderGid: e.orderGid,
 
-      // UI обычно ждёт orderName — оставим, но берём из orderNumber
-      orderName: (e as any).orderNumber ?? null,
+          // UI обычно ждёт orderName — оставим, но берём из orderNumber
+          orderName: (e as any).orderNumber ?? null,
 
-      topic: e.topic,
+          topic: e.topic,
 
-      // оставляем для совместимости/других мест
-      eventAt: timeIso,
+          // оставляем для совместимости/других мест
+          eventAt: timeIso,
 
-      decision: e.decision ?? null,
-      skipReason:
-        normalizeSkipReason((e as any)?.reasons?.summary ?? null) ??
-        normalizeSkipReason((e as any).skipReason) ??
-        null,
-      orderAdminUrl,
-    };
-  },
-),
+          decision: e.decision ?? null,
+          skipReason:
+            normalizeSkipReason((e as any)?.reasons?.summary ?? null) ??
+            normalizeSkipReason((e as any).skipReason) ??
+            null,
+          orderAdminUrl,
+          rulesVersion: (e as any).rulesVersion ?? null,
+          rulesSnapshot: Array.isArray((e as any).rulesSnapshot) ? ((e as any).rulesSnapshot as any[]) : null,
+        };
+      },
+    ),
 
 
 
@@ -241,6 +275,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
           updatedAt: it.updatedAt.toISOString(),
           orderAdminUrl,
           rulesVersion: latestEvent?.rulesVersion ?? null,
+          rulesSnapshot: latestEvent?.rulesSnapshot ?? null,
 
           // trust (field-safe during migration)
           lastTopic: (it as any).lastTopic ?? null,
@@ -260,6 +295,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
 
 function diffRuleChanges(
   before: {
+    type: string;
     enabled: boolean;
     operator: string;
     value: string;
@@ -268,6 +304,7 @@ function diffRuleChanges(
     status: RuleStatus;
   },
   after: {
+    type: string;
     enabled: boolean;
     operator: string;
     value: string;
@@ -277,6 +314,10 @@ function diffRuleChanges(
   }
 ) {
   const changes: Array<{ field: string; from: string | null; to: string | null }> = [];
+
+  if (before.type !== after.type) {
+    changes.push({ field: "ruleType", from: before.type, to: after.type });
+  }
 
   if (before.enabled !== after.enabled) {
     changes.push({ field: "enabled", from: String(before.enabled), to: String(after.enabled) });
@@ -331,6 +372,57 @@ export async function action({ request }: ActionFunctionArgs) {
   const lang = parseLang(url.searchParams.get("lang"));
   const form = await request.formData();
   const intent = String(form.get("_action") ?? "");
+
+  if (intent === "simulate") {
+    const orderGid = String(form.get("orderGid") ?? "").trim();
+    if (!orderGid) return json<ActionData>({ ok: false, error: t(lang, "errorMissingOrderGid") }, 400);
+
+    const event = await prisma.riskEvent.findFirst({
+      where: { shop: session.shop, orderGid },
+      orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+      select: {
+        snapshot: true,
+        riskScore: true,
+        decision: true,
+        reasons: true,
+      },
+    });
+
+    if (!event?.snapshot) {
+      return json<ActionData>({ ok: false, error: t(lang, "errorNoSnapshot") }, 404);
+    }
+
+    const simulated = await computeRiskFromSnapshot(session.shop, event.snapshot as any);
+    const currentFactors = extractFactorsFromReasons(event.reasons as any);
+    const simulatedFactors = simulated.reasons.map(toSimFactor);
+
+    const currentKeys = new Set(currentFactors.map((f) => f.ruleKey));
+    const simulatedKeys = new Set(simulatedFactors.map((f) => f.ruleKey));
+
+    const added = simulatedFactors.filter((f) => !currentKeys.has(f.ruleKey));
+    const removed = currentFactors.filter((f) => !simulatedKeys.has(f.ruleKey));
+
+    return json<ActionData>({
+      ok: true,
+      op: "simulate",
+      orderGid,
+      current: {
+        decision: event.decision,
+        score: event.riskScore,
+        factors: currentFactors,
+      },
+      simulated: {
+        decision: simulated.decision ?? "ALLOW",
+        score: simulated.score,
+        factors: simulatedFactors,
+      },
+      diff: {
+        scoreDiff: simulated.score - event.riskScore,
+        added,
+        removed,
+      },
+    });
+  }
 
   if (intent === "loadRuleHistory") {
     const cursorChangedAt = String(form.get("cursorChangedAt") ?? "").trim();
@@ -484,7 +576,10 @@ export async function action({ request }: ActionFunctionArgs) {
       ruleId: created.id,
       changedBy: session.shop,
       changedByType: "SHOP",
-      changes: [{ field: "created", from: null, to: "true" }],
+      changes: [
+        { field: "ruleType", from: null, to: created.type },
+        { field: "created", from: null, to: "true" },
+      ],
     });
 
     return json<ActionData>({
@@ -550,7 +645,10 @@ export async function action({ request }: ActionFunctionArgs) {
         ruleId: id,
         changedBy: session.shop,
         changedByType: "SHOP",
-        changes,
+        changes: [
+          { field: "ruleType", from: exists.type, to: type },
+          ...changes,
+        ],
       });
     }
 
@@ -573,6 +671,7 @@ export async function action({ request }: ActionFunctionArgs) {
         changedBy: session.shop,
         changedByType: "SHOP",
         changes: [
+          { field: "ruleType", from: rule.type, to: rule.type },
           {
             field: "enabled",
             from: String(rule.enabled),
@@ -596,7 +695,10 @@ export async function action({ request }: ActionFunctionArgs) {
       ruleId: id,
       changedBy: session.shop,
       changedByType: "SHOP",
-      changes: [{ field: "deleted", from: "false", to: "true" }],
+      changes: [
+        { field: "ruleType", from: rule.type, to: rule.type },
+        { field: "deleted", from: "false", to: "true" },
+      ],
     });
     await prisma.riskRule.delete({ where: { id } });
     return json<ActionData>({ ok: true, op: "deleteRule", id });
@@ -617,6 +719,10 @@ export default function AppIndex() {
   const level = (params.get("level") ?? "ALL").toUpperCase();
   const focusedRuleId = params.get("ruleId");
   const [openFactorId, setOpenFactorId] = useState<string | null>(null);
+  const [openRulesetId, setOpenRulesetId] = useState<string | null>(null);
+  const simulateFetcher = useFetcher<ActionData>();
+  const [simulationByOrder, setSimulationByOrder] = useState<Record<string, any>>({});
+  const simLoadingOrderGid = simulateFetcher.formData?.get("orderGid");
 
   type Tab = "orders" | "rules" | "events";
 
@@ -625,6 +731,12 @@ export default function AppIndex() {
     p.set("tab", next);
     setParams(p);
   };
+
+  useEffect(() => {
+    const d = simulateFetcher.data;
+    if (!d || !d.ok || d.op !== "simulate") return;
+    setSimulationByOrder((prev) => ({ ...prev, [d.orderGid]: d }));
+  }, [simulateFetcher.data]);
 
   const setLevel = (lvl: string) => {
     const p = new URLSearchParams(params);
@@ -638,6 +750,7 @@ export default function AppIndex() {
     p.set("lang", next);
     setParams(p);
   };
+
 
   return (
     <div style={page}>
@@ -740,14 +853,105 @@ export default function AppIndex() {
                               lang={lang}
                             />
                           </div>
+                          <div style={{ marginTop: 6 }}>
+                            <simulateFetcher.Form method="post" action="?index" style={{ display: "inline-block" }}>
+                              <input type="hidden" name="_action" value="simulate" />
+                              <input type="hidden" name="orderGid" value={r.orderGid} />
+                              <button
+                                type="submit"
+                                style={secondaryBtn}
+                                disabled={simulateFetcher.state !== "idle" && simLoadingOrderGid === r.orderGid}
+                              >
+                                {simulateFetcher.state === "submitting" && simLoadingOrderGid === r.orderGid
+                                  ? t(lang, "simulating")
+                                  : t(lang, "simulateWithCurrent")}
+                              </button>
+                            </simulateFetcher.Form>
+                          </div>
+                          {simulationByOrder[r.orderGid] ? (
+                            <div style={simulationBox}>
+                              <div style={{ fontSize: 12, color: "#6d7175" }}>
+                                {t(lang, "current")}:{" "}
+                                <b>{decisionLabel(lang, simulationByOrder[r.orderGid].current.decision)}</b> ·{" "}
+                                {t(lang, "score")}: {simulationByOrder[r.orderGid].current.score}
+                              </div>
+                              <div style={{ fontSize: 12, color: "#6d7175" }}>
+                                {t(lang, "simulated")}:{" "}
+                                <b>{decisionLabel(lang, simulationByOrder[r.orderGid].simulated.decision)}</b> ·{" "}
+                                {t(lang, "score")}: {simulationByOrder[r.orderGid].simulated.score}{" "}
+                                <span style={{ marginLeft: 6 }}>
+                                  ({t(lang, "scoreDiff")}: {simulationByOrder[r.orderGid].diff.scoreDiff})
+                                </span>
+                              </div>
+                              <div style={{ marginTop: 6, fontSize: 12 }}>
+                                <div style={{ color: "#6d7175" }}>{t(lang, "matchedRulesDiff")}:</div>
+                                <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+                                  <div>
+                                    <span style={subtle}>{t(lang, "added")}: </span>
+                                    {simulationByOrder[r.orderGid].diff.added.length ? (
+                                      simulationByOrder[r.orderGid].diff.added.map((f: SimFactor) => (
+                                        <code key={f.ruleKey} style={codeInline}>
+                                          {ruleTypeLabel(lang, f.ruleType as RuleType)}
+                                        </code>
+                                      ))
+                                    ) : (
+                                      <span style={subtle}>—</span>
+                                    )}
+                                  </div>
+                                  <div>
+                                    <span style={subtle}>{t(lang, "removed")}: </span>
+                                    {simulationByOrder[r.orderGid].diff.removed.length ? (
+                                      simulationByOrder[r.orderGid].diff.removed.map((f: SimFactor) => (
+                                        <code key={f.ruleKey} style={codeInline}>
+                                          {ruleTypeLabel(lang, f.ruleType as RuleType)}
+                                        </code>
+                                      ))
+                                    ) : (
+                                      <span style={subtle}>—</span>
+                                    )}
+                                  </div>
+                                </div>
+                              </div>
+                            </div>
+                          ) : null}
                           <div style={{ marginTop: 2, fontSize: 12, color: "#6d7175" }}>
-                            {t(lang, "rulesVersionLabel")}:{" "}
                             {r.rulesVersion ? (
-                              <code style={codeInline} title={r.rulesVersion}>
-                                {shortRulesVersion(r.rulesVersion)}
-                              </code>
+                              <>
+                                {t(lang, "evaluatedWithRuleset")}{" "}
+                                {Array.isArray(r.rulesSnapshot) ? (
+                                  <span style={{ position: "relative", display: "inline-flex" }}>
+                                    <span
+                                      style={popoverTrigger}
+                                      tabIndex={0}
+                                      onClick={() =>
+                                        setOpenRulesetId(openRulesetId === r.id ? null : r.id)
+                                      }
+                                      onBlur={() => {
+                                        window.setTimeout(() => setOpenRulesetId(null), 0);
+                                      }}
+                                    >
+                                      <code style={codeInline} title={r.rulesVersion}>
+                                        v{shortRulesVersion(r.rulesVersion)}
+                                      </code>
+                                    </span>
+                                    {openRulesetId === r.id ? (
+                                      <div style={popoverCard}>
+                                        {rulesetPopoverLines(r.rulesSnapshot, lang).map((line) => (
+                                          <div key={line} style={popoverLine}>
+                                            {line}
+                                          </div>
+                                        ))}
+                                      </div>
+                                    ) : null}
+                                  </span>
+                                ) : (
+                                  <code style={codeInline} title={r.rulesVersion}>
+                                    v{shortRulesVersion(r.rulesVersion)}
+                                  </code>
+                                )}
+                              </>
                             ) : (
-                              <span style={subtle}>—</span>
+                              <span style={subtle}>{t(lang, "rulesetUnknown")}</span>
                             )}
                           </div>
                         </td>
@@ -828,7 +1032,12 @@ export default function AppIndex() {
       ) : tab === "rules" ? (
         <RulesInline data={data} lang={lang} focusedRuleId={focusedRuleId} />
       ) : (
-        <EventsTab data={data} lang={lang} />
+        <EventsTab
+          data={data}
+          lang={lang}
+          openRulesetId={openRulesetId}
+          setOpenRulesetId={setOpenRulesetId}
+        />
       )}
     </div>
   );
@@ -1074,8 +1283,15 @@ function RulesInline({
             </thead>
 
             <tbody>
-              {localRules.map((r) => (
-                <tr key={r.id} id={`rule-${r.id}`} style={focusedRuleId === r.id ? ruleFocusRow : undefined}>
+              {localRules.map((r) => {
+                const rowStyle =
+                  r.status === "DEPRECATED"
+                    ? { ...ruleDeprecatedRow, ...(focusedRuleId === r.id ? ruleFocusRow : {}) }
+                    : focusedRuleId === r.id
+                      ? ruleFocusRow
+                      : undefined;
+                return (
+                <tr key={r.id} id={`rule-${r.id}`} style={rowStyle}>
                   <td style={td}>
                     <button
                       type="button"
@@ -1100,6 +1316,7 @@ function RulesInline({
                         </option>
                       ))}
                     </select>
+                    {r.status === "DEPRECATED" ? <span style={deprecatedBadge}>{t(lang, "deprecated")}</span> : null}
                   </td>
 
                   <td style={td}>
@@ -1175,7 +1392,7 @@ function RulesInline({
                     </button>
                   </td>
                 </tr>
-              ))}
+              )})}
             </tbody>
           </table>
         </div>
@@ -1188,81 +1405,82 @@ function RulesInline({
         <addFetcher.Form ref={addFormRef} method="post" action="?index" style={formGrid}>
           <input type="hidden" name="_action" value="addRule" />
 
-        <label style={field}>
-          <span style={label}>{t(lang, "type")}</span>
-          <select
-            name="type"
-            value={newRuleType}
-            style={control}
-            title={ruleTypeDescription(lang, newRuleType) || ruleTypeLabel(lang, newRuleType)}
-            onChange={(e) => setNewRuleType(e.target.value as RuleType)}
-          >
-            {allowedTypes.map((tt) => (
-              <option key={tt} value={tt}>
-                {ruleTypeLabel(lang, tt)}
-              </option>
-            ))}
-          </select>
-          {ruleTypeDescription(lang, newRuleType) ? (
-            <div style={{ ...subtle, marginTop: 6 }}>{ruleTypeDescription(lang, newRuleType)}</div>
-          ) : null}
+          <label style={field}>
+            <span style={label}>{t(lang, "type")}</span>
+            <select
+              name="type"
+              value={newRuleType}
+              style={control}
+              title={ruleTypeDescription(lang, newRuleType) || ruleTypeLabel(lang, newRuleType)}
+              onChange={(e) => setNewRuleType(e.target.value as RuleType)}
+            >
+              {allowedTypes.map((tt) => (
+                <option key={tt} value={tt}>
+                  {ruleTypeLabel(lang, tt)}
+                </option>
+              ))}
+            </select>
         </label>
 
-        <label style={field}>
-          <span style={label}>{t(lang, "operator")}</span>
-          <select name="operator" defaultValue=">" style={control}>
-            <option value=">">{">"}</option>
-            <option value=">=">{">="}</option>
-            <option value="=">{"="}</option>
-            <option value="!=">{"!="}</option>
-            <option value="<">{"<"}</option>
-            <option value="<=">{"<="}</option>
-          </select>
-        </label>
+          <label style={field}>
+            <span style={label}>{t(lang, "operator")}</span>
+            <select name="operator" defaultValue=">" style={control}>
+              <option value=">">{">"}</option>
+              <option value=">=">{">="}</option>
+              <option value="=">{"="}</option>
+              <option value="!=">{"!="}</option>
+              <option value="<">{"<"}</option>
+              <option value="<=">{"<="}</option>
+            </select>
+          </label>
 
-        <label style={field}>
-          <span style={label}>{t(lang, "value")}</span>
-          <input name="value" placeholder={t(lang, "valuePlaceholder")} style={control} />
-        </label>
+          <label style={field}>
+            <span style={label}>{t(lang, "value")}</span>
+            <input name="value" placeholder={t(lang, "valuePlaceholder")} style={control} />
+          </label>
 
-        <label style={field}>
-          <span style={label}>{t(lang, "points")}</span>
-          <input name="points" placeholder={t(lang, "pointsPlaceholder")} defaultValue="15" style={control} />
-        </label>
+          <label style={field}>
+            <span style={label}>{t(lang, "points")}</span>
+            <input name="points" placeholder={t(lang, "pointsPlaceholder")} defaultValue="15" style={control} />
+          </label>
 
-        <label style={field}>
-          <span style={label}>{t(lang, "status")}</span>
-          <select
-            name="status"
-            value={newRuleStatus}
-            style={control}
-            onChange={(e) => setNewRuleStatus(e.target.value as RuleStatus)}
-          >
-            {allowedStatuses.map((st) => (
-              <option key={st} value={st}>
-                {ruleStatusLabel(lang, st)}
-              </option>
-            ))}
-          </select>
-        </label>
+          <label style={field}>
+            <span style={label}>{t(lang, "status")}</span>
+            <select
+              name="status"
+              value={newRuleStatus}
+              style={control}
+              onChange={(e) => setNewRuleStatus(e.target.value as RuleStatus)}
+            >
+              {allowedStatuses.map((st) => (
+                <option key={st} value={st}>
+                  {ruleStatusLabel(lang, st)}
+                </option>
+              ))}
+            </select>
+          </label>
 
-        <label style={field}>
-          <span style={label}>{t(lang, "action")}</span>
-          <input name="action" placeholder={t(lang, "actionPlaceholderAdd")} style={control} />
-        </label>
+          <label style={{ ...field, gridColumn: "span 2" }}>
+            <span style={label}>{t(lang, "action")}</span>
+            <input
+              name="action"
+              placeholder={t(lang, "actionPlaceholderAdd")}
+              style={control}
+            />
+          </label>
 
-          <div style={{ display: "flex", alignItems: "end" }}>
+          <div style={formActions}>
             <button type="submit" style={primaryBtn} disabled={addFetcher.state !== "idle"}>
               {addFetcher.state === "submitting" ? t(lang, "addingRule") : t(lang, "addRuleBtn")}
             </button>
           </div>
         </addFetcher.Form>
 
-      {addFetcher.data && !addFetcher.data.ok ? (
-        <div style={{ marginTop: 10, fontSize: 13, color: "#8a2a0a" }}>
-          {t(lang, "error")}: {addFetcher.data.error}
-        </div>
-      ) : null}
+        {addFetcher.data && !addFetcher.data.ok ? (
+          <div style={{ marginTop: 10, fontSize: 13, color: "#8a2a0a" }}>
+            {t(lang, "error")}: {addFetcher.data.error}
+          </div>
+        ) : null}
 
         <div style={{ marginTop: 10, fontSize: 13, color: "#6d7175" }}>
           {t(lang, "examples")}:{" "}
@@ -1312,7 +1530,17 @@ function RulesInline({
 
 /* ---------- Events tab (✅ теперь тут Recent events блок) ---------- */
 
-function EventsTab({ data, lang }: { data: LoaderData; lang: Lang }) {
+function EventsTab({
+  data,
+  lang,
+  openRulesetId,
+  setOpenRulesetId,
+}: {
+  data: LoaderData;
+  lang: Lang;
+  openRulesetId: string | null;
+  setOpenRulesetId: (next: string | null) => void;
+}) {
   return (
     <section style={card}>
       <div style={cardHeaderRow}>
@@ -1335,6 +1563,7 @@ function EventsTab({ data, lang }: { data: LoaderData; lang: Lang }) {
                 <th style={th}>{t(lang, "evTopic")}</th>
                 <th style={th}>{t(lang, "evOrder")}</th>
                 <th style={th}>{t(lang, "evDecision")}</th>
+                <th style={th}>{t(lang, "rulesVersionLabel")}</th>
                 <th style={th}>{t(lang, "thLink")}</th>
               </tr>
             </thead>
@@ -1357,6 +1586,44 @@ function EventsTab({ data, lang }: { data: LoaderData; lang: Lang }) {
 
                   <td style={td}>
                     <DecisionDisplay decision={e.decision} skipReason={e.skipReason} lang={lang} />
+                  </td>
+
+                  <td style={td}>
+                    {e.rulesVersion ? (
+                      Array.isArray(e.rulesSnapshot) ? (
+                        <span style={{ position: "relative", display: "inline-flex" }}>
+                          <span
+                            style={popoverTrigger}
+                            tabIndex={0}
+                            onClick={() =>
+                              setOpenRulesetId(openRulesetId === e.id ? null : e.id)
+                            }
+                            onBlur={() => {
+                              window.setTimeout(() => setOpenRulesetId(null), 0);
+                            }}
+                          >
+                            <code style={codeInline} title={e.rulesVersion}>
+                              v{shortRulesVersion(e.rulesVersion)}
+                            </code>
+                          </span>
+                          {openRulesetId === e.id ? (
+                            <div style={popoverCard}>
+                              {rulesetPopoverLines(e.rulesSnapshot, lang).map((line) => (
+                                <div key={line} style={popoverLine}>
+                                  {line}
+                                </div>
+                              ))}
+                            </div>
+                          ) : null}
+                        </span>
+                      ) : (
+                        <code style={codeInline} title={e.rulesVersion}>
+                          v{shortRulesVersion(e.rulesVersion)}
+                        </code>
+                      )
+                    ) : (
+                      <span style={subtle}>—</span>
+                    )}
                   </td>
 
                   <td style={td}>
@@ -1505,6 +1772,21 @@ function extractReasonsArray(reasons: any) {
   return null;
 }
 
+function extractFactorsFromReasons(reasons: any): SimFactor[] {
+  const factors = Array.isArray(reasons?.factors) ? reasons.factors : [];
+  return factors
+    .map((f: any) => toSimFactor(f))
+    .filter((f) => f.ruleKey);
+}
+
+function toSimFactor(factor: any): SimFactor {
+  const ruleKey =
+    factor && typeof factor.ruleKey === "string" ? factor.ruleKey : factor?.label ? `legacy:${factor.label}` : "";
+  const label = typeof factor?.label === "string" ? factor.label : "";
+  const ruleType = typeof factor?.ruleType === "string" ? factor.ruleType : label;
+  return { ruleKey, label, ruleType };
+}
+
 function ruleTypeLabel(lang: Lang, type: RuleType) {
   const key = `ruleType_${type}`;
   const value = t(lang, key);
@@ -1574,6 +1856,24 @@ function factorPopoverLines(reason: any, lang: Lang) {
   ];
 }
 
+function rulesetPopoverLines(snapshot: any[] | null, lang: Lang) {
+  if (!Array.isArray(snapshot)) return [];
+  if (snapshot.length === 0) return [t(lang, "rulesetEmpty")];
+  return snapshot.map((rule) => {
+    const ruleKey = typeof rule?.ruleKey === "string" ? rule.ruleKey : "";
+    const typeLabel = ruleKey ? ruleTypeLabel(lang, ruleKey as RuleType) : t(lang, "emptyValue");
+    const operator = typeof rule?.params?.operator === "string" ? rule.params.operator : "";
+    const value = typeof rule?.params?.value === "string" ? rule.params.value : "";
+    const threshold = operator && value ? `${operator} ${value}` : t(lang, "emptyValue");
+    const weight = Number.isFinite(rule?.weight) ? String(rule.weight) : t(lang, "emptyValue");
+    const action = rule?.action ? String(rule.action) : t(lang, "emptyValue");
+    const enabled = rule?.enabled ? t(lang, "on") : t(lang, "off");
+    return `${typeLabel} | ${t(lang, "threshold")}: ${threshold} | ${t(lang, "points")}: ${weight} | ${
+      t(lang, "action")
+    }: ${action} | ${enabled}`;
+  });
+}
+
 function riskLevelLabel(lang: Lang, level: Row["riskLevel"]) {
   const key = level.toLowerCase();
   return t(lang, key);
@@ -1590,23 +1890,35 @@ function decisionLabel(lang: Lang, decision: string) {
 function formatRuleChangeSummary(entry: RuleChange, lang: Lang) {
   if (!entry.changes.length) return t(lang, "noChangeDetails");
 
+  const ruleTypeEntry = entry.changes.find((c) => c.field === "ruleType");
+  const ruleTypeLabelText = ruleTypeEntry?.to
+    ? ruleTypeLabel(lang, ruleTypeEntry.to as RuleType)
+    : null;
+
   const created = entry.changes.find((c) => c.field === "created");
   if (created) {
-    return `${t(lang, "change_created")} ${t(lang, "change_rule")}`;
+    return `${t(lang, "change_created")} ${t(lang, "change_rule")}${
+      ruleTypeLabelText ? `: ${ruleTypeLabelText}` : ""
+    }`;
   }
 
   const deleted = entry.changes.find((c) => c.field === "deleted");
   if (deleted) {
-    return `${t(lang, "change_deleted")} ${t(lang, "change_rule")}`;
+    return `${t(lang, "change_deleted")} ${t(lang, "change_rule")}${
+      ruleTypeLabelText ? `: ${ruleTypeLabelText}` : ""
+    }`;
   }
 
-  const parts = entry.changes.map((change) => {
+  const parts = entry.changes
+    .filter((change) => change.field !== "ruleType")
+    .map((change) => {
     const fieldLabel = t(lang, `change_${change.field}`);
     const from = formatChangeValue(change.from, lang);
     const to = formatChangeValue(change.to, lang);
     return `${fieldLabel}: ${from} → ${to}`;
   });
-  return parts.join("; ");
+  const prefix = ruleTypeLabelText ? `${t(lang, "ruleLabel")}: ${ruleTypeLabelText} · ` : "";
+  return prefix + parts.join("; ");
 }
 
 function formatChangeValue(value: string | null, lang: Lang) {
@@ -1936,8 +2248,14 @@ const primaryBtn: React.CSSProperties = {
 
 const formGrid: React.CSSProperties = {
   display: "grid",
-  gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
+  gridTemplateColumns: "repeat(4, minmax(180px, 1fr))",
   gap: 10,
+  alignItems: "end",
+};
+
+const formActions: React.CSSProperties = {
+  display: "flex",
+  justifyContent: "flex-end",
   alignItems: "end",
 };
 
@@ -1956,6 +2274,34 @@ const cardInner: React.CSSProperties = {
 
 const ruleFocusRow: React.CSSProperties = {
   background: "#fff5ea",
+};
+
+const ruleDeprecatedRow: React.CSSProperties = {
+  background: "#f3f4f5",
+  color: "#5f6368",
+};
+
+const deprecatedBadge: React.CSSProperties = {
+  display: "inline-flex",
+  alignItems: "center",
+  marginLeft: 8,
+  padding: "2px 8px",
+  borderRadius: 999,
+  fontSize: 11,
+  fontWeight: 800,
+  textTransform: "uppercase",
+  letterSpacing: "0.04em",
+  border: "1px solid #eadab8",
+  background: "#fff5dd",
+  color: "#7a4a00",
+};
+
+const simulationBox: React.CSSProperties = {
+  marginTop: 8,
+  padding: "8px 10px",
+  border: "1px solid #dfe3e8",
+  borderRadius: 10,
+  background: "#fbfbfb",
 };
 
 const label: React.CSSProperties = {
