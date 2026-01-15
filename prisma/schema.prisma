@@ -14,27 +14,27 @@ datasource db {
 }
 
 model Session {
-  id            String    @id
-  shop          String
-  state         String
-  isOnline      Boolean   @default(false)
-  scope         String?
-  expires       DateTime?
-  accessToken   String
-  userId        BigInt?
-  firstName     String?
-  lastName      String?
-  email         String?
-  accountOwner  Boolean   @default(false)
-  locale        String?
-  collaborator  Boolean?  @default(false)
-  emailVerified Boolean?  @default(false)
+  id                  String    @id
+  shop                String
+  state               String
+  isOnline            Boolean   @default(false)
+  scope               String?
+  expires             DateTime?
+  accessToken         String
+  userId              BigInt?
+  firstName           String?
+  lastName            String?
+  email               String?
+  accountOwner        Boolean   @default(false)
+  locale              String?
+  collaborator        Boolean?  @default(false)
+  emailVerified       Boolean?  @default(false)
   refreshToken        String?
   refreshTokenExpires DateTime?
 }
 
 model RiskResult {
-  id          String   @id @default(cuid())
+  id          String @id @default(cuid())
   shop        String
   orderGid    String
   orderName   String
@@ -42,18 +42,21 @@ model RiskResult {
   riskLevel   String
   reasonsJson String
 
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt @default(now())
+  createdAt DateTime @default(now())
+  updatedAt DateTime @default(now()) @updatedAt
+
+  lastEventId String?
+  lastEvent   RiskEvent? @relation("RiskResultLastEvent", fields: [lastEventId], references: [id])
 
   // trust features
-  lastTopic        String?
-  lastEventAt      DateTime?
-  eventCount       Int      @default(0)
-  payloadHash      String?
+  lastTopic   String?
+  lastEventAt DateTime?
+  eventCount  Int       @default(0)
+  payloadHash String?
 
   // ✅ why we skipped / what happened
-  lastDecision     String?  // "APPLIED" | "SKIPPED"
-  skipReason       String?  // "UNCHANGED" | "NO_RULES" | etc.
+  lastDecision String? // "APPLIED" | "SKIPPED"
+  skipReason   String? // "UNCHANGED" | "NO_RULES" | etc.
 
   // ✅ new trust feature
   lastRiskChangeAt DateTime?
@@ -65,16 +68,16 @@ model RiskResult {
 }
 
 model RiskRule {
-  id        String   @id @default(cuid())
-  shop      String
+  id   String @id @default(cuid())
+  shop String
 
-  type      String   // ORDER_VALUE | FIRST_TIME | COUNTRY_MISMATCH | HIGH_QTY
-  operator  String   // > | = | != | >=
-  value     String   // "300", "true", "DE"
-  points    Int
+  type     String // ORDER_VALUE | FIRST_TIME | COUNTRY_MISMATCH | HIGH_QTY
+  operator String // > | = | != | >=
+  value    String // "300", "true", "DE"
+  points   Int
 
-  action    String?  // TAG:high_risk | HOLD | REVIEW
-  enabled   Boolean  @default(true)
+  action  String? // TAG:high_risk | HOLD | REVIEW
+  enabled Boolean @default(true)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -82,25 +85,51 @@ model RiskRule {
   @@index([shop])
 }
 
-model RiskEvent {
-  id         String   @id @default(cuid())
-
-  shop       String
-  orderGid   String
-  orderName  String
-
-  topic      String
-  eventAt    DateTime
-  payloadHash String?
-
-  decision   String?  // "ALLOW" | "REVIEW" | "HOLD"
-  skipReason String?  // "UNCHANGED" | "NO_RULES" | etc.
-  reasonsJson String?
-
-  createdAt  DateTime @default(now())
-
-  @@index([shop, createdAt])
-  @@index([shop, orderGid, createdAt])
-  @@index([shop, eventAt])
+enum RiskEventSource {
+  ORDERS_CREATE
+  ORDERS_UPDATED
+  ORDERS_PAID
 }
 
+enum RiskLevel {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+enum RiskDecision {
+  ALLOW
+  REVIEW
+  HOLD
+}
+
+model RiskEvent {
+  id String @id @default(cuid())
+
+  // identity
+  shop        String
+  orderGid    String
+  orderNumber String?
+
+  // webhook meta
+  source    RiskEventSource
+  topic     String // e.g. "orders/create"
+  webhookId String? // if you can extract Shopify webhook id/header
+  createdAt DateTime        @default(now())
+
+  // core data
+  snapshot  Json // normalized "safe" order snapshot (no protected customer data)
+  evaluated Json // [{ ruleId, ruleKey, matched, weight, details? }]
+  reasons   Json // explainability v2: { summary, factors:[...] }
+
+  // computed outcome
+  riskScore Int
+  riskLevel RiskLevel
+  decision  RiskDecision
+
+  asLastEventFor RiskResult[] @relation("RiskResultLastEvent")
+
+  @@index([shop, orderGid])
+  @@index([shop, createdAt])
+  @@index([shop, orderGid, createdAt])
+}

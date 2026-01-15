@@ -7,11 +7,11 @@ import { computeRiskFromWebhookPayload } from "../riskmate/riskEngine.server";
 import { upsertRiskIfChanged } from "../riskmate/riskStore.server";
 import { createOrderRiskAssessment } from "../riskmate/orderRiskAssessment.server";
 import { setOrderRiskTags } from "../riskmate/shopifyActions.server";
+
 import crypto from "crypto";
 import prisma from "../db.server";
-import { logRiskEvent } from "../riskmate/riskEventStore.server";
-import { decisionFromRiskLevel } from "../riskmate/decision";
 
+// ---------------- helpers ----------------
 
 function normalizeTopic(topic: unknown) {
   const t = String(topic ?? "").toLowerCase().trim();
@@ -24,6 +24,7 @@ function normalizeTopic(topic: unknown) {
 /**
  * Важно: hash считаем только по “важным” полям.
  * Это даёт идемпотентность и не триггерит пересчёт/сайд-эффекты на мусорные апдейты.
+ * (и при этом не хранит protected data)
  */
 function pickStableRiskFields(payload: any) {
   return {
@@ -37,7 +38,7 @@ function pickStableRiskFields(payload: any) {
     shippingCountry: payload?.shipping_address?.country_code ?? null,
     billingCountry: payload?.billing_address?.country_code ?? null,
     customerOrdersCount: payload?.customer?.orders_count ?? null,
-    // намеренно НЕ добавляем email/zip/phone (protected data)
+    // намеренно НЕ добавляем email/zip/phone/name/address1 (protected)
   };
 }
 
@@ -45,6 +46,53 @@ function sha1(obj: any) {
   const s = JSON.stringify(obj);
   return crypto.createHash("sha1").update(s).digest("hex");
 }
+
+function webhookIdFromHeaders(request: Request): string | null {
+  const h = request.headers;
+  return h.get("x-shopify-webhook-id") || h.get("X-Shopify-Webhook-Id") || null;
+}
+
+function topicToSource(t: string): "ORDERS_CREATE" | "ORDERS_UPDATED" | null {
+  if (t === "orders/create") return "ORDERS_CREATE";
+  if (t === "orders/updated") return "ORDERS_UPDATED";
+  return null;
+}
+
+function normalizeRiskLevel(level: any): "LOW" | "MEDIUM" | "HIGH" {
+  const v = String(level ?? "").toUpperCase();
+  if (v === "HIGH") return "HIGH";
+  if (v === "MEDIUM") return "MEDIUM";
+  return "LOW";
+}
+
+function buildReasonsV2FromString(reasonsJson: string | null | undefined) {
+  if (!reasonsJson) return { summary: "No reasons provided", factors: [] as any[] };
+
+  try {
+    const parsed = JSON.parse(reasonsJson);
+
+    // already v2
+    if (parsed && typeof parsed === "object" && Array.isArray((parsed as any).factors)) {
+      return parsed;
+    }
+
+    // array legacy
+    if (Array.isArray(parsed)) {
+      return {
+        summary: "Risk reasons",
+        factors: parsed.map((x) => ({ label: String(x) })),
+      };
+    }
+
+    // object but not v2
+    return { summary: "Risk reasons", factors: [{ label: JSON.stringify(parsed) }] };
+  } catch {
+    // plain string
+    return { summary: "Risk reasons", factors: [{ label: String(reasonsJson) }] };
+  }
+}
+
+// ---------------- route ----------------
 
 export async function action({ request }: ActionFunctionArgs) {
   try {
@@ -59,7 +107,7 @@ export async function action({ request }: ActionFunctionArgs) {
       return new Response("OK");
     }
 
-    // orders/*
+    // only create/update for now (paid can stay in allow-list but we won't map it to source)
     const allowed = new Set(["orders/create", "orders/updated", "orders/paid"]);
     if (!allowed.has(t)) return new Response("OK");
 
@@ -73,9 +121,10 @@ export async function action({ request }: ActionFunctionArgs) {
 
     console.log("[RiskMate] order event", { shop, topic: t, orderGid, orderName });
 
-    // ---- NEW: stable hash + trust meta ----
+    // ---- stable hash + eventAt ----
     const stable = pickStableRiskFields(payload);
     const payloadHash = sha1(stable);
+
     const eventAt =
       (payload as any)?.updated_at
         ? new Date((payload as any).updated_at)
@@ -83,17 +132,14 @@ export async function action({ request }: ActionFunctionArgs) {
           ? new Date((payload as any).processed_at)
           : new Date();
 
-    // ---- NEW: out-of-order guard (protect from older webhooks overwriting newer) ----
-    // If we already saw a newer event for this order, we still record that this event arrived,
-    // but we skip risk compute + side-effects.
+    // ---- out-of-order guard ----
     const existing = await prisma.riskResult.findUnique({
       where: { shop_orderGid: { shop, orderGid } },
       select: { lastEventAt: true, riskLevel: true },
     });
 
     if (existing?.lastEventAt && existing.lastEventAt.getTime() > eventAt.getTime()) {
-      // In practice, now is "server receive time", so this mainly protects against weird races
-      // if you later switch to Shopify event time.
+      // update trust fields only
       await prisma.riskResult.update({
         where: { shop_orderGid: { shop, orderGid } },
         data: {
@@ -104,68 +150,101 @@ export async function action({ request }: ActionFunctionArgs) {
         },
       });
 
-      await logRiskEvent({
-        shop,
-        orderGid,
-        orderName: orderName ?? "",
-        topic: t,
-        eventAt: eventAt,
-        payloadHash,
-        decision: decisionFromRiskLevel(existing?.riskLevel ?? null),
-        skipReason: "OUT_OF_ORDER",
-      });
+      // still append RiskEvent (central log)
+      const source = topicToSource(t);
+      if (source) {
+
+        await prisma.riskEvent.create({
+          data: {
+            shop,
+            orderGid,
+            orderNumber: orderName ?? null,
+            source,
+            topic: t,
+            webhookId: webhookIdFromHeaders(request),
+
+            snapshot: stable, // safe snapshot
+            evaluated: [], // not computed
+            reasons: { summary: "Skipped: out of order", factors: [] },
+
+            riskScore: 0,
+            riskLevel: "LOW",
+            decision: "ALLOW",
+          },
+        });
+      }
 
       console.log("[RiskMate] out-of-order -> skip", { shop, orderGid, topic: t });
       return new Response("OK");
     }
 
-    // 1) Compute risk (может учитывать t === orders/paid внутри)
+    // 1) Compute risk (движок может учитывать topic внутри)
     const computed = await computeRiskFromWebhookPayload(shop, payload, t);
 
-    // 2) Store (idempotent) + decide whether to run side-effects
-    //    Важно: store-слой должен:
-    //    - всегда инкрементить eventCount и обновлять lastTopic/lastEventAt
-    //    - если payloadHash не изменился -> skipped=true (не трогаем score/reasons)
-    //    - если изменился -> обновляем score/reasons + payloadHash
+    const riskScore = Number(computed?.score ?? 0);
+    const riskLevel = normalizeRiskLevel(computed?.riskLevel);
+    const reasonsV2 = buildReasonsV2FromString(computed?.reasonsJson ?? null);
+
+    // 2) Store (idempotent) + decide side-effects
     const store = await upsertRiskIfChanged({
       shop,
       orderGid,
       orderName: orderName ?? "",
-      score: computed.score,
-      riskLevel: computed.riskLevel,
-      reasonsJson: computed.reasonsJson,
+      score: riskScore,
+      riskLevel,
+      reasonsJson: computed?.reasonsJson ?? JSON.stringify(reasonsV2),
 
-      // NEW fields
       payloadHash,
       lastTopic: t,
       lastEventAt: eventAt,
     });
 
-    await logRiskEvent({
-      shop,
-      orderGid,
-      orderName: orderName ?? "",
-      topic: t,
-      eventAt: eventAt,
-      payloadHash,
-      decision: computed.decision,
-      skipReason: store.skipped ? "UNCHANGED" : null,
-      reasonsJson: computed.reasonsJson,
-    });
+    // 3) Append RiskEvent ALWAYS (central log)
+    // source is required in RiskEvent => only create/update are supported as true RiskEvents
+    const source = topicToSource(t);
+    if (source) {
+      const eventReasons = store.skipped
+        ? { summary: "Skipped: unchanged", factors: [] }
+        : reasonsV2;
+      const decision =
+        riskLevel === "HIGH" ? "HOLD" :
+          riskLevel === "MEDIUM" ? "REVIEW" :
+            "ALLOW";
+
+      await prisma.riskEvent.create({
+        data: {
+          shop,
+          orderGid,
+          orderNumber: orderName ?? null,
+
+          source,
+          topic: t,
+          webhookId: webhookIdFromHeaders(request),
+
+          snapshot: stable, // safe snapshot (можно заменить на более широкий safe snapshot позже)
+          evaluated: computed?.evaluatedRules ?? [], // если у тебя движок начнёт отдавать — подхватим
+          reasons: eventReasons,
+
+          riskScore: store.skipped ? 0 : riskScore,
+          riskLevel: store.skipped ? "LOW" : (riskLevel as any),
+          decision,
+        },
+      });
+    }
 
     if (store.skipped) {
       console.log("[RiskMate] unchanged (hash) -> skip side-effects", { shop, orderGid, orderName });
       return new Response("OK");
     }
 
-    // 3) Side-effects in Shopify (только когда реально изменился risk)
+    // 4) Side-effects in Shopify (только если реально изменился risk)
     await setOrderRiskTags(admin, orderGid, {
-      level: computed.riskLevel,
+      level: riskLevel,
       extra: [], // MVP: никаких дополнительных тегов
-      cleanStatusTags: true, // чистим risk_review/risk_hold при смене уровня
+      cleanStatusTags: true,
     });
 
-    await createOrderRiskAssessment(admin, orderGid, computed.riskLevel, computed.facts);
+    await createOrderRiskAssessment(admin, orderGid, riskLevel, computed?.facts);
 
     return new Response("OK");
   } catch (err: any) {
