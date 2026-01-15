@@ -81,15 +81,66 @@ function buildReasonsV2FromString(reasonsJson: string | null | undefined) {
     if (Array.isArray(parsed)) {
       return {
         summary: "Risk reasons",
-        factors: parsed.map((x) => ({ label: String(x) })),
+        factors: parsed.map((x) => {
+          const label = String(x);
+          return {
+            type: "RULE",
+            label,
+            description: label,
+            ruleKey: `legacy:${label}`,
+            weight: 0,
+            evidence: {},
+            ruleType: label,
+            operator: "",
+            value: "",
+            action: null,
+            status: "",
+          };
+        }),
       };
     }
 
     // object but not v2
-    return { summary: "Risk reasons", factors: [{ label: JSON.stringify(parsed) }] };
+    const label = JSON.stringify(parsed);
+    return {
+      summary: "Risk reasons",
+      factors: [
+        {
+          type: "RULE",
+          label,
+          description: label,
+          ruleKey: `legacy:${label}`,
+          weight: 0,
+          evidence: {},
+          ruleType: label,
+          operator: "",
+          value: "",
+          action: null,
+          status: "",
+        },
+      ],
+    };
   } catch {
     // plain string
-    return { summary: "Risk reasons", factors: [{ label: String(reasonsJson) }] };
+    const label = String(reasonsJson);
+    return {
+      summary: "Risk reasons",
+      factors: [
+        {
+          type: "RULE",
+          label,
+          description: label,
+          ruleKey: `legacy:${label}`,
+          weight: 0,
+          evidence: {},
+          ruleType: label,
+          operator: "",
+          value: "",
+          action: null,
+          status: "",
+        },
+      ],
+    };
   }
 }
 
