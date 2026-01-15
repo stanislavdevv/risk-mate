@@ -7,8 +7,9 @@ export async function logRiskEvent(input: {
   topic: string;
   eventAt: Date;
   payloadHash?: string | null;
-  decision?: string | null;   // "APPLIED" | "SKIPPED"
+  decision?: string | null;   // "ALLOW" | "REVIEW" | "HOLD"
   skipReason?: string | null; // "UNCHANGED" | "NO_RULES" | ...
+  reasonsJson?: string | null;
 }) {
   await prisma.riskEvent.create({
     data: {
@@ -20,6 +21,7 @@ export async function logRiskEvent(input: {
       payloadHash: input.payloadHash ?? null,
       decision: input.decision ?? null,
       skipReason: input.skipReason ?? null,
+      reasonsJson: input.reasonsJson ?? null,
     },
   });
 }

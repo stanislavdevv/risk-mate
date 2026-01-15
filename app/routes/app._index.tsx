@@ -94,6 +94,29 @@ export async function loader({ request }: LoaderFunctionArgs) {
     take: tab === "events" ? 100 : 50,
   });
 
+  const orderGids = items.map((it) => it.orderGid);
+  const latestEventsByOrder = new Map<
+    string,
+    { decision: string | null; skipReason: string | null; reasonsJson: string | null }
+  >();
+
+  if (orderGids.length > 0) {
+    const orderEvents = await prisma.riskEvent.findMany({
+      where: { shop: session.shop, orderGid: { in: orderGids } },
+      orderBy: [{ eventAt: "desc" }, { createdAt: "desc" }],
+    });
+
+    for (const event of orderEvents) {
+      if (!latestEventsByOrder.has(event.orderGid)) {
+        latestEventsByOrder.set(event.orderGid, {
+          decision: event.decision ?? null,
+          skipReason: event.skipReason ?? null,
+          reasonsJson: (event as any).reasonsJson ?? null,
+        });
+      }
+    }
+  }
+
   // recent events (if model exists)
   let events: any[] = [];
   try {
@@ -153,6 +176,8 @@ export async function loader({ request }: LoaderFunctionArgs) {
       (it): Row => {
         const orderId = orderIdFromGid(it.orderGid);
         const orderAdminUrl = orderId ? shopifyAdminOrderUrl(session.shop, orderId) : null;
+        const latestEvent = latestEventsByOrder.get(it.orderGid);
+        const reasons = latestEvent?.reasonsJson ? safeJsonParse(latestEvent.reasonsJson) : [];
 
         return {
           id: it.id,
@@ -160,7 +185,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
           orderName: it.orderName,
           score: it.score,
           riskLevel: it.riskLevel as Row["riskLevel"],
-          reasons: safeJsonParse(it.reasonsJson),
+          reasons,
           createdAt: it.createdAt.toISOString(),
           updatedAt: it.updatedAt.toISOString(),
           orderAdminUrl,
@@ -170,8 +195,8 @@ export async function loader({ request }: LoaderFunctionArgs) {
           lastEventAt: (it as any).lastEventAt ? (it as any).lastEventAt.toISOString() : null,
           eventCount: Number((it as any).eventCount ?? 0),
           lastRiskChangeAt: (it as any).lastRiskChangeAt ? (it as any).lastRiskChangeAt.toISOString() : null,
-          lastDecision: (it as any).lastDecision ?? null,
-          skipReason: (it as any).skipReason ?? null,
+          lastDecision: latestEvent?.decision ?? null,
+          skipReason: latestEvent?.skipReason ?? null,
         };
       },
     ),
@@ -483,10 +508,11 @@ export default function AppIndex() {
                           </div>
                           <div style={{ marginTop: 2, fontSize: 12, color: "#6d7175" }}>
                             {t(lang, "decision")}:{" "}
-                            <code style={codeInline}>
-                              {r.lastDecision ?? "—"}
-                              {r.skipReason ? ` (${r.skipReason})` : ""}
-                            </code>
+                            <DecisionDisplay
+                              decision={r.lastDecision}
+                              skipReason={r.skipReason}
+                              lang={lang}
+                            />
                           </div>
                         </td>
 
@@ -947,10 +973,7 @@ function EventsTab({ data, lang }: { data: LoaderData; lang: Lang }) {
                   </td>
 
                   <td style={td}>
-                    <code style={codeInline}>
-                      {e.decision ?? "—"}
-                      {e.skipReason ? ` (${e.skipReason})` : ""}
-                    </code>
+                    <DecisionDisplay decision={e.decision} skipReason={e.skipReason} lang={lang} />
                   </td>
 
                   <td style={td}>
@@ -1106,6 +1129,34 @@ function EmptyState({ title, children }: { title: string; children: React.ReactN
   );
 }
 
+function skipTooltip(skipReason: string, lang: Lang) {
+  if (skipReason === "UNCHANGED") {
+    return t(lang, "skippedTooltipUnchanged");
+  }
+  return t(lang, "skippedTooltipGeneric", { reason: skipReason });
+}
+
+function DecisionDisplay({
+  decision,
+  skipReason,
+  lang,
+}: {
+  decision: string | null;
+  skipReason: string | null;
+  lang: Lang;
+}) {
+  return (
+    <span style={decisionInline}>
+      <code style={codeInline}>{decision ?? "—"}</code>
+      {skipReason ? (
+        <span style={skipBadge} title={skipTooltip(skipReason, lang)}>
+          ⏭️ {t(lang, "skipped")}
+        </span>
+      ) : null}
+    </span>
+  );
+}
+
 /* ---------- styles ---------- */
 
 const page: React.CSSProperties = {
@@ -1237,6 +1288,26 @@ const codeInline: React.CSSProperties = {
   padding: "2px 6px",
   borderRadius: 8,
   border: "1px solid #edf0f2",
+};
+
+const decisionInline: React.CSSProperties = {
+  display: "inline-flex",
+  alignItems: "center",
+  gap: 6,
+  flexWrap: "wrap",
+};
+
+const skipBadge: React.CSSProperties = {
+  display: "inline-flex",
+  alignItems: "center",
+  gap: 4,
+  padding: "2px 8px",
+  borderRadius: 999,
+  border: "1px solid #dfe3e8",
+  background: "#f6f6f7",
+  color: "#6d7175",
+  fontSize: 12,
+  fontWeight: 700,
 };
 
 function riskPill(level: "LOW" | "MEDIUM" | "HIGH"): React.CSSProperties {

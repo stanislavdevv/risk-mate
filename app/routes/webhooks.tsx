@@ -10,6 +10,7 @@ import { setOrderRiskTags } from "../riskmate/shopifyActions.server";
 import crypto from "crypto";
 import prisma from "../db.server";
 import { logRiskEvent } from "../riskmate/riskEventStore.server";
+import { decisionFromRiskLevel } from "../riskmate/decision";
 
 
 function normalizeTopic(topic: unknown) {
@@ -87,7 +88,7 @@ export async function action({ request }: ActionFunctionArgs) {
     // but we skip risk compute + side-effects.
     const existing = await prisma.riskResult.findUnique({
       where: { shop_orderGid: { shop, orderGid } },
-      select: { lastEventAt: true },
+      select: { lastEventAt: true, riskLevel: true },
     });
 
     if (existing?.lastEventAt && existing.lastEventAt.getTime() > eventAt.getTime()) {
@@ -99,10 +100,19 @@ export async function action({ request }: ActionFunctionArgs) {
           lastTopic: t,
           lastEventAt: eventAt,
           eventCount: { increment: 1 },
-          lastDecision: "SKIPPED",
-          skipReason: "OUT_OF_ORDER",
           orderName: orderName ?? "",
         },
+      });
+
+      await logRiskEvent({
+        shop,
+        orderGid,
+        orderName: orderName ?? "",
+        topic: t,
+        eventAt: eventAt,
+        payloadHash,
+        decision: decisionFromRiskLevel(existing?.riskLevel ?? null),
+        skipReason: "OUT_OF_ORDER",
       });
 
       console.log("[RiskMate] out-of-order -> skip", { shop, orderGid, topic: t });
@@ -138,8 +148,9 @@ export async function action({ request }: ActionFunctionArgs) {
       topic: t,
       eventAt: eventAt,
       payloadHash,
-      decision: store.skipped ? "SKIPPED" : "APPLIED",
+      decision: computed.decision,
       skipReason: store.skipped ? "UNCHANGED" : null,
+      reasonsJson: computed.reasonsJson,
     });
 
     if (store.skipped) {

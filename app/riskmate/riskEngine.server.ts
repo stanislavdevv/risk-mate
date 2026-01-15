@@ -2,6 +2,7 @@ import prisma from "../db.server";
 import { evaluateRules } from "./rules.engine";
 import { calculateRiskLevel } from "./riskLevel";
 import type { RiskLevel } from "./types";
+import { decisionFromRiskLevel, type Decision } from "./decision";
 
 const SCORE_MIN = 0;
 const SCORE_MAX = 100;
@@ -71,6 +72,7 @@ export async function computeRiskFromWebhookPayload(
 ): Promise<{
   score: number;
   riskLevel: RiskLevel;
+  decision: Decision | null;
   reasons: any[];
   reasonsJson: string;
   actions: string[];
@@ -114,6 +116,7 @@ export async function computeRiskFromWebhookPayload(
 
   // 3) Risk level is derived ONLY from score (policy source of truth)
   const riskLevel = calculateRiskLevel(score);
+  const decision = decisionFromRiskLevel(riskLevel);
 
   // 4) MVP policy tags (minimal)
   // We do NOT honor arbitrary TAG:* actions in MVP.
@@ -148,6 +151,7 @@ export async function computeRiskFromWebhookPayload(
   return {
     score,
     riskLevel,
+    decision,
     reasons,
     reasonsJson: safeJson(reasons),
     actions,

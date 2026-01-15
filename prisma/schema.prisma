@@ -93,8 +93,9 @@ model RiskEvent {
   eventAt    DateTime
   payloadHash String?
 
-  decision   String?  // "APPLIED" | "SKIPPED"
+  decision   String?  // "ALLOW" | "REVIEW" | "HOLD"
   skipReason String?  // "UNCHANGED" | "NO_RULES" | etc.
+  reasonsJson String?
 
   createdAt  DateTime @default(now())
 
@@ -102,5 +103,4 @@ model RiskEvent {
   @@index([shop, orderGid, createdAt])
   @@index([shop, eventAt])
 }
-
 
