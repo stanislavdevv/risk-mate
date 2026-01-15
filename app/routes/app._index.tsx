@@ -177,7 +177,8 @@ export async function loader({ request }: LoaderFunctionArgs) {
         const orderId = orderIdFromGid(it.orderGid);
         const orderAdminUrl = orderId ? shopifyAdminOrderUrl(session.shop, orderId) : null;
         const latestEvent = latestEventsByOrder.get(it.orderGid);
-        const reasons = latestEvent?.reasonsJson ? safeJsonParse(latestEvent.reasonsJson) : [];
+        const reasonsSource = latestEvent?.reasonsJson ?? it.reasonsJson;
+        const reasons = reasonsSource ? safeJsonParse(reasonsSource) : [];
 
         return {
           id: it.id,
@@ -195,8 +196,8 @@ export async function loader({ request }: LoaderFunctionArgs) {
           lastEventAt: (it as any).lastEventAt ? (it as any).lastEventAt.toISOString() : null,
           eventCount: Number((it as any).eventCount ?? 0),
           lastRiskChangeAt: (it as any).lastRiskChangeAt ? (it as any).lastRiskChangeAt.toISOString() : null,
-          lastDecision: latestEvent?.decision ?? null,
-          skipReason: latestEvent?.skipReason ?? null,
+          lastDecision: latestEvent?.decision ?? (it as any).lastDecision ?? null,
+          skipReason: latestEvent?.skipReason ?? (it as any).skipReason ?? null,
         };
       },
     ),
