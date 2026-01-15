@@ -2,7 +2,7 @@ import type { RiskRule } from "@prisma/client";
 import crypto from "crypto";
 import prisma from "../db.server";
 
-type RulesetRule = Pick<RiskRule, "type" | "enabled" | "operator" | "value" | "points" | "action">;
+type RulesetRule = Pick<RiskRule, "type" | "enabled" | "operator" | "value" | "points" | "action" | "status">;
 
 type CanonicalRule = {
   ruleKey: string;
@@ -55,7 +55,7 @@ export function computeRulesVersion(rules: RulesetRule[]): string {
 
 export async function getCurrentRulesVersion(shop: string): Promise<string> {
   const rules = await prisma.riskRule.findMany({
-    where: { shop },
+    where: { shop, status: "ACTIVE" },
     orderBy: { createdAt: "asc" },
   });
   return computeRulesVersion(rules);
