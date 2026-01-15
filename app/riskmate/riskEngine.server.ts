@@ -82,7 +82,7 @@ export async function computeRiskFromWebhookPayload(
   rulesVersion: string;
 }> {
   const rules = await prisma.riskRule.findMany({
-    where: { shop },
+    where: { shop, status: "ACTIVE" },
     orderBy: { createdAt: "asc" },
   });
   const rulesVersion = computeRulesVersion(rules);

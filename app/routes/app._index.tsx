@@ -11,6 +11,7 @@ import { computeRulesVersion } from "../riskmate/rulesetVersion.server";
 
 type RuleType = "ORDER_VALUE" | "FIRST_TIME" | "HIGH_QTY" | "COUNTRY_MISMATCH";
 type RuleOp = ">" | ">=" | "=" | "!=" | "<" | "<=";
+type RuleStatus = "DRAFT" | "ACTIVE" | "DEPRECATED";
 
 type Rule = {
   id: string;
@@ -20,7 +21,17 @@ type Rule = {
   points: number;
   action: string | null;
   enabled: boolean;
+  status: RuleStatus;
   createdAt: string;
+};
+
+type RuleChange = {
+  id: string;
+  ruleId: string;
+  changedAt: string;
+  changedBy: string;
+  changedByType: string;
+  changes: Array<{ field: string; from: string | null; to: string | null }>;
 };
 
 type RiskEventRow = {
@@ -63,6 +74,7 @@ type ActionData =
   | { ok: true; op: "updateRule"; id: string }
   | { ok: true; op: "toggleRule"; id: string; enabled: boolean }
   | { ok: true; op: "deleteRule"; id: string }
+  | { ok: true; op: "loadRuleHistory"; items: RuleChange[]; hasMore: boolean }
   | { ok: false; error: string };
 
 /* ---------- loader ---------- */
@@ -86,7 +98,22 @@ export async function loader({ request }: LoaderFunctionArgs) {
     where: { shop: session.shop },
     orderBy: { createdAt: "desc" },
   });
-  const currentRulesVersion = computeRulesVersion(rules);
+  const currentRulesVersion = computeRulesVersion(rules.filter((r) => r.status === "ACTIVE"));
+
+  const ruleChanges = await prisma.riskRuleChange.findMany({
+    where: { shop: session.shop },
+    orderBy: [{ changedAt: "desc" }, { id: "desc" }],
+    take: 6,
+  });
+  const initialRuleChanges = ruleChanges.slice(0, 5).map((change) => ({
+    id: change.id,
+    ruleId: change.ruleId,
+    changedAt: change.changedAt.toISOString(),
+    changedBy: change.changedBy,
+    changedByType: change.changedByType,
+    changes: Array.isArray(change.changes) ? (change.changes as any) : [],
+  }));
+  const hasMoreRuleChanges = ruleChanges.length > 5;
 
   const where: any = { shop: session.shop };
   if (level === "LOW" || level === "MEDIUM" || level === "HIGH") where.riskLevel = level;
@@ -148,6 +175,8 @@ export async function loader({ request }: LoaderFunctionArgs) {
     hasRules,
     hasChecks,
     currentRulesVersion,
+    ruleChanges: initialRuleChanges,
+    hasMoreRuleChanges,
     rules: rules.map(
       (r): Rule => ({
         id: r.id,
@@ -157,6 +186,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
         points: r.points,
         action: r.action,
         enabled: r.enabled,
+        status: r.status as RuleStatus,
         createdAt: r.createdAt.toISOString(),
       }),
     ),
@@ -228,6 +258,71 @@ export async function loader({ request }: LoaderFunctionArgs) {
   };
 }
 
+function diffRuleChanges(
+  before: {
+    enabled: boolean;
+    operator: string;
+    value: string;
+    points: number;
+    action: string | null;
+    status: RuleStatus;
+  },
+  after: {
+    enabled: boolean;
+    operator: string;
+    value: string;
+    points: number;
+    action: string | null;
+    status: RuleStatus;
+  }
+) {
+  const changes: Array<{ field: string; from: string | null; to: string | null }> = [];
+
+  if (before.enabled !== after.enabled) {
+    changes.push({ field: "enabled", from: String(before.enabled), to: String(after.enabled) });
+  }
+
+  if (before.operator !== after.operator || before.value !== after.value) {
+    changes.push({
+      field: "threshold",
+      from: `${before.operator} ${before.value}`,
+      to: `${after.operator} ${after.value}`,
+    });
+  }
+
+  if (before.points !== after.points) {
+    changes.push({ field: "weight", from: String(before.points), to: String(after.points) });
+  }
+
+  if ((before.action ?? "") !== (after.action ?? "")) {
+    changes.push({ field: "action", from: before.action, to: after.action });
+  }
+
+  if (before.status !== after.status) {
+    changes.push({ field: "status", from: before.status, to: after.status });
+  }
+
+  return changes;
+}
+
+async function recordRuleChange(input: {
+  shop: string;
+  ruleId: string;
+  changedBy: string;
+  changedByType: string;
+  changes: Array<{ field: string; from: string | null; to: string | null }>;
+}) {
+  await prisma.riskRuleChange.create({
+    data: {
+      shop: input.shop,
+      ruleId: input.ruleId,
+      changedBy: input.changedBy,
+      changedByType: input.changedByType,
+      changes: input.changes,
+    },
+  });
+}
+
 /* ---------- action ---------- */
 
 export async function action({ request }: ActionFunctionArgs) {
@@ -237,15 +332,61 @@ export async function action({ request }: ActionFunctionArgs) {
   const form = await request.formData();
   const intent = String(form.get("_action") ?? "");
 
+  if (intent === "loadRuleHistory") {
+    const cursorChangedAt = String(form.get("cursorChangedAt") ?? "").trim();
+    const cursorId = String(form.get("cursorId") ?? "").trim();
+
+    const where =
+      cursorChangedAt && cursorId
+        ? {
+            shop: session.shop,
+            OR: [
+              { changedAt: { lt: new Date(cursorChangedAt) } },
+              { AND: [{ changedAt: new Date(cursorChangedAt) }, { id: { lt: cursorId } }] },
+            ],
+          }
+        : { shop: session.shop };
+
+    const changes = await prisma.riskRuleChange.findMany({
+      where,
+      orderBy: [{ changedAt: "desc" }, { id: "desc" }],
+      take: 6,
+    });
+
+    const items = changes.slice(0, 5).map((change) => ({
+      id: change.id,
+      ruleId: change.ruleId,
+      changedAt: change.changedAt.toISOString(),
+      changedBy: change.changedBy,
+      changedByType: change.changedByType,
+      changes: Array.isArray(change.changes) ? (change.changes as any) : [],
+    }));
+
+    return json<ActionData>({
+      ok: true,
+      op: "loadRuleHistory",
+      items,
+      hasMore: changes.length > 5,
+    });
+  }
+
   const allowedTypes: RuleType[] = ["ORDER_VALUE", "FIRST_TIME", "HIGH_QTY", "COUNTRY_MISMATCH"];
   const allowedOps: RuleOp[] = [">", ">=", "=", "!=", "<", "<="];
+  const allowedStatuses: RuleStatus[] = ["DRAFT", "ACTIVE", "DEPRECATED"];
 
-  const validate = (p: { type: string; operator: string; value: string; points: number }): string[] => {
+  const validate = (p: {
+    type: string;
+    operator: string;
+    value: string;
+    points: number;
+    status: string;
+  }): string[] => {
     const errors: string[] = [];
     if (!allowedTypes.includes(p.type as RuleType)) errors.push(t(lang, "errorUnsupportedRuleType"));
     if (!allowedOps.includes(p.operator as RuleOp)) errors.push(t(lang, "errorUnsupportedOperator"));
     if (!p.value) errors.push(t(lang, "errorValueRequired"));
     if (!Number.isFinite(p.points)) errors.push(t(lang, "errorPointsNumber"));
+    if (!allowedStatuses.includes(p.status as RuleStatus)) errors.push(t(lang, "errorUnsupportedStatus"));
 
     if (p.type === "FIRST_TIME") {
       const v = p.value.toLowerCase();
@@ -306,6 +447,7 @@ export async function action({ request }: ActionFunctionArgs) {
         points: r.points,
         action: r.action,
         enabled: r.enabled,
+        status: r.status as RuleStatus,
         createdAt: r.createdAt.toISOString(),
       }));
 
@@ -320,7 +462,8 @@ export async function action({ request }: ActionFunctionArgs) {
     const actionValue = String(form.get("action") ?? "").trim();
     const points = Number(pointsRaw);
 
-    const errors = validate({ type, operator, value, points });
+    const status = String(form.get("status") ?? "ACTIVE").trim();
+    const errors = validate({ type, operator, value, points, status });
     if (errors.length) return json<ActionData>({ ok: false, error: errors.join("; ") }, 400);
 
     const created = await prisma.riskRule.create({
@@ -331,8 +474,17 @@ export async function action({ request }: ActionFunctionArgs) {
         value,
         points: Math.trunc(points),
         action: actionValue ? actionValue : null,
+        status: status as RuleStatus,
         enabled: true,
       },
+    });
+
+    await recordRuleChange({
+      shop: session.shop,
+      ruleId: created.id,
+      changedBy: session.shop,
+      changedByType: "SHOP",
+      changes: [{ field: "created", from: null, to: "true" }],
     });
 
     return json<ActionData>({
@@ -346,6 +498,7 @@ export async function action({ request }: ActionFunctionArgs) {
         points: created.points,
         action: created.action,
         enabled: created.enabled,
+        status: created.status as RuleStatus,
         createdAt: created.createdAt.toISOString(),
       },
     });
@@ -358,6 +511,7 @@ export async function action({ request }: ActionFunctionArgs) {
     const value = String(form.get("value") ?? "").trim();
     const pointsRaw = String(form.get("points") ?? "").trim();
     const actionValue = String(form.get("action") ?? "").trim();
+    const status = String(form.get("status") ?? "ACTIVE").trim();
 
     if (!id) return json<ActionData>({ ok: false, error: t(lang, "errorMissingId") }, 400);
 
@@ -365,8 +519,18 @@ export async function action({ request }: ActionFunctionArgs) {
     if (!exists) return json<ActionData>({ ok: false, error: t(lang, "errorRuleNotFound") }, 404);
 
     const points = Number(pointsRaw);
-    const errors = validate({ type, operator, value, points });
+    const errors = validate({ type, operator, value, points, status });
     if (errors.length) return json<ActionData>({ ok: false, error: errors.join("; ") }, 400);
+
+    const changes = diffRuleChanges(exists, {
+      type,
+      operator,
+      value,
+      points: Math.trunc(points),
+      action: actionValue ? actionValue : null,
+      enabled: exists.enabled,
+      status: status as RuleStatus,
+    });
 
     await prisma.riskRule.update({
       where: { id },
@@ -376,8 +540,19 @@ export async function action({ request }: ActionFunctionArgs) {
         value,
         points: Math.trunc(points),
         action: actionValue ? actionValue : null,
+        status: status as RuleStatus,
       },
     });
+
+    if (changes.length > 0) {
+      await recordRuleChange({
+        shop: session.shop,
+        ruleId: id,
+        changedBy: session.shop,
+        changedByType: "SHOP",
+        changes,
+      });
+    }
 
     return json<ActionData>({ ok: true, op: "updateRule", id });
   }
@@ -391,6 +566,21 @@ export async function action({ request }: ActionFunctionArgs) {
     if (!rule) return json<ActionData>({ ok: false, error: t(lang, "errorRuleNotFound") }, 404);
 
     await prisma.riskRule.update({ where: { id }, data: { enabled } });
+    if (rule.enabled !== enabled) {
+      await recordRuleChange({
+        shop: session.shop,
+        ruleId: id,
+        changedBy: session.shop,
+        changedByType: "SHOP",
+        changes: [
+          {
+            field: "enabled",
+            from: String(rule.enabled),
+            to: String(enabled),
+          },
+        ],
+      });
+    }
     return json<ActionData>({ ok: true, op: "toggleRule", id, enabled });
   }
 
@@ -401,6 +591,13 @@ export async function action({ request }: ActionFunctionArgs) {
     const rule = await prisma.riskRule.findFirst({ where: { id, shop: session.shop } });
     if (!rule) return json<ActionData>({ ok: false, error: t(lang, "errorRuleNotFound") }, 404);
 
+    await recordRuleChange({
+      shop: session.shop,
+      ruleId: id,
+      changedBy: session.shop,
+      changedByType: "SHOP",
+      changes: [{ field: "deleted", from: "false", to: "true" }],
+    });
     await prisma.riskRule.delete({ where: { id } });
     return json<ActionData>({ ok: true, op: "deleteRule", id });
   }
@@ -628,8 +825,13 @@ function RulesInline({ data, lang }: { data: LoaderData; lang: Lang }) {
 
   const allowedTypes: RuleType[] = ["ORDER_VALUE", "FIRST_TIME", "HIGH_QTY", "COUNTRY_MISMATCH"];
   const allowedOps: RuleOp[] = [">", ">=", "=", "!=", "<", "<="];
+  const allowedStatuses: RuleStatus[] = ["DRAFT", "ACTIVE", "DEPRECATED"];
 
   const [newRuleType, setNewRuleType] = useState<RuleType>("ORDER_VALUE");
+  const [newRuleStatus, setNewRuleStatus] = useState<RuleStatus>("ACTIVE");
+  const [ruleHistory, setRuleHistory] = useState<RuleChange[]>(data.ruleChanges ?? []);
+  const [hasMoreHistory, setHasMoreHistory] = useState<boolean>(Boolean(data.hasMoreRuleChanges));
+  const historyFetcher = useFetcher<ActionData>();
 
   const [ui, setUi] = useState<{ state: "idle" | "saving" | "saved" | "error"; msg?: string }>({ state: "idle" });
 
@@ -660,6 +862,7 @@ function RulesInline({ data, lang }: { data: LoaderData; lang: Lang }) {
     setLocalRules((prev) => [d.rule, ...prev]);
     addFormRef.current?.reset();
     setNewRuleType("ORDER_VALUE");
+    setNewRuleStatus("ACTIVE");
     setUi({ state: "saved" });
     window.setTimeout(() => setUi((s) => (s.state === "saved" ? { state: "idle" } : s)), 900);
   }, [addFetcher.data]);
@@ -686,6 +889,15 @@ function RulesInline({ data, lang }: { data: LoaderData; lang: Lang }) {
     }
   }, [mutateFetcher.data]);
 
+  useEffect(() => {
+    const d = historyFetcher.data;
+    if (!d || !d.ok || d.op !== "loadRuleHistory") return;
+    if (d.items?.length) {
+      setRuleHistory((prev) => [...prev, ...d.items]);
+    }
+    setHasMoreHistory(Boolean(d.hasMore));
+  }, [historyFetcher.data]);
+
   function submitUpdate(rule: Rule) {
     const payloadKey = JSON.stringify({
       id: rule.id,
@@ -694,6 +906,7 @@ function RulesInline({ data, lang }: { data: LoaderData; lang: Lang }) {
       value: rule.value,
       points: rule.points,
       action: rule.action ?? "",
+      status: rule.status,
     });
 
     if (lastPayloadRef.current[rule.id] === payloadKey) return;
@@ -707,6 +920,7 @@ function RulesInline({ data, lang }: { data: LoaderData; lang: Lang }) {
     fd.set("value", rule.value);
     fd.set("points", String(rule.points));
     fd.set("action", rule.action ?? "");
+    fd.set("status", rule.status);
 
     saveFetcher.submit(fd, { method: "post", action: "?index" });
   }
@@ -796,20 +1010,20 @@ function RulesInline({ data, lang }: { data: LoaderData; lang: Lang }) {
           <table style={tableRules}>
             <colgroup>
               <col style={{ width: 86 }} />
+              <col style={{ width: 120 }} />
               <col style={{ width: 210 }} />
-              <col style={{ width: 140 }} />
               <col style={{ width: 220 }} />
               <col style={{ width: 110 }} />
-              <col style={{ width: 260 }} />
-              <col style={{ width: 110 }} />
+              <col style={{ width: 240 }} />
+              <col style={{ width: 150 }} />
             </colgroup>
 
             <thead>
               <tr>
                 <th style={th}>{t(lang, "enabled")}</th>
+                <th style={th}>{t(lang, "status")}</th>
                 <th style={th}>{t(lang, "type")}</th>
-                <th style={th}>{t(lang, "operator")}</th>
-                <th style={th}>{t(lang, "value")}</th>
+                <th style={th}>{t(lang, "threshold")}</th>
                 <th style={th}>{t(lang, "points")}</th>
                 <th style={th}>{t(lang, "action")}</th>
                 <th style={th}></th>
@@ -832,6 +1046,21 @@ function RulesInline({ data, lang }: { data: LoaderData; lang: Lang }) {
 
                   <td style={td}>
                     <select
+                      value={r.status}
+                      style={cellControl}
+                      onChange={(e) => updateRuleLocal(r.id, { status: e.target.value as RuleStatus })}
+                      onBlur={() => scheduleSave(r, true)}
+                    >
+                      {allowedStatuses.map((st) => (
+                        <option key={st} value={st}>
+                          {ruleStatusLabel(lang, st)}
+                        </option>
+                      ))}
+                    </select>
+                  </td>
+
+                  <td style={td}>
+                    <select
                       value={r.type}
                       style={cellControl}
                       title={ruleTypeDescription(lang, r.type) || ruleTypeLabel(lang, r.type)}
@@ -847,27 +1076,26 @@ function RulesInline({ data, lang }: { data: LoaderData; lang: Lang }) {
                   </td>
 
                   <td style={td}>
-                    <select
-                      value={r.operator}
-                      style={cellControl}
-                      onChange={(e) => updateRuleLocal(r.id, { operator: e.target.value as RuleOp })}
-                      onBlur={() => scheduleSave(r, true)}
-                    >
-                      {allowedOps.map((op) => (
-                        <option key={op} value={op}>
-                          {op}
-                        </option>
-                      ))}
-                    </select>
-                  </td>
-
-                  <td style={td}>
-                    <input
-                      value={r.value}
-                      style={cellControl}
-                      onChange={(e) => updateRuleLocal(r.id, { value: e.target.value })}
-                      onBlur={() => scheduleSave(r, true)}
-                    />
+                    <div style={cellGroup}>
+                      <select
+                        value={r.operator}
+                        style={cellControlCompact}
+                        onChange={(e) => updateRuleLocal(r.id, { operator: e.target.value as RuleOp })}
+                        onBlur={() => scheduleSave(r, true)}
+                      >
+                        {allowedOps.map((op) => (
+                          <option key={op} value={op}>
+                            {op}
+                          </option>
+                        ))}
+                      </select>
+                      <input
+                        value={r.value}
+                        style={cellControl}
+                        onChange={(e) => updateRuleLocal(r.id, { value: e.target.value })}
+                        onBlur={() => scheduleSave(r, true)}
+                      />
+                    </div>
                   </td>
 
                   <td style={td}>
@@ -911,10 +1139,11 @@ function RulesInline({ data, lang }: { data: LoaderData; lang: Lang }) {
       )}
 
       <div style={{ height: 16 }} />
-      <h3 style={h3}>{t(lang, "addRuleTitle")}</h3>
+      <section style={cardInner}>
+        <h3 style={h3}>{t(lang, "addRuleTitle")}</h3>
 
-      <addFetcher.Form ref={addFormRef} method="post" action="?index" style={formGrid}>
-        <input type="hidden" name="_action" value="addRule" />
+        <addFetcher.Form ref={addFormRef} method="post" action="?index" style={formGrid}>
+          <input type="hidden" name="_action" value="addRule" />
 
         <label style={field}>
           <span style={label}>{t(lang, "type")}</span>
@@ -959,16 +1188,32 @@ function RulesInline({ data, lang }: { data: LoaderData; lang: Lang }) {
         </label>
 
         <label style={field}>
+          <span style={label}>{t(lang, "status")}</span>
+          <select
+            name="status"
+            value={newRuleStatus}
+            style={control}
+            onChange={(e) => setNewRuleStatus(e.target.value as RuleStatus)}
+          >
+            {allowedStatuses.map((st) => (
+              <option key={st} value={st}>
+                {ruleStatusLabel(lang, st)}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        <label style={field}>
           <span style={label}>{t(lang, "action")}</span>
           <input name="action" placeholder={t(lang, "actionPlaceholderAdd")} style={control} />
         </label>
 
-        <div style={{ display: "flex", alignItems: "end" }}>
-          <button type="submit" style={primaryBtn} disabled={addFetcher.state !== "idle"}>
-            {addFetcher.state === "submitting" ? t(lang, "addingRule") : t(lang, "addRuleBtn")}
-          </button>
-        </div>
-      </addFetcher.Form>
+          <div style={{ display: "flex", alignItems: "end" }}>
+            <button type="submit" style={primaryBtn} disabled={addFetcher.state !== "idle"}>
+              {addFetcher.state === "submitting" ? t(lang, "addingRule") : t(lang, "addRuleBtn")}
+            </button>
+          </div>
+        </addFetcher.Form>
 
       {addFetcher.data && !addFetcher.data.ok ? (
         <div style={{ marginTop: 10, fontSize: 13, color: "#8a2a0a" }}>
@@ -976,12 +1221,48 @@ function RulesInline({ data, lang }: { data: LoaderData; lang: Lang }) {
         </div>
       ) : null}
 
-      <div style={{ marginTop: 10, fontSize: 13, color: "#6d7175" }}>
-        {t(lang, "examples")}:{" "}
-        <code style={codeInline}>{`${ruleTypeLabel(lang, "FIRST_TIME")} = true`}</code>,{" "}
-        <code style={codeInline}>{`${ruleTypeLabel(lang, "ORDER_VALUE")} > 300`}</code>,{" "}
-        <code style={codeInline}>REVIEW</code>.
-      </div>
+        <div style={{ marginTop: 10, fontSize: 13, color: "#6d7175" }}>
+          {t(lang, "examples")}:{" "}
+          <code style={codeInline}>{`${ruleTypeLabel(lang, "FIRST_TIME")} = true`}</code>,{" "}
+          <code style={codeInline}>{`${ruleTypeLabel(lang, "ORDER_VALUE")} > 300`}</code>,{" "}
+          <code style={codeInline}>REVIEW</code>.
+        </div>
+      </section>
+
+      <div style={{ height: 16 }} />
+      <section style={cardInner}>
+        <div style={cardHeaderRow}>
+          <div>
+            <h3 style={h3}>{t(lang, "recentChangesTitle")}</h3>
+            <div style={subtle}>{t(lang, "recentChangesSubtitle")}</div>
+          </div>
+        </div>
+        <div style={divider} />
+        {ruleHistory.length ? (
+          <ul style={{ margin: 0, paddingLeft: 18 }}>
+            {ruleHistory.map((h) => (
+              <li key={h.id}>
+                <code style={codeInline}>{formatDate(h.changedAt)}</code> {t(lang, "by")} {h.changedBy}:{" "}
+                {formatRuleChangeSummary(h, lang)}
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <span style={subtle}>{t(lang, "noHistory")}</span>
+        )}
+        {hasMoreHistory ? (
+          <div style={{ marginTop: 10 }}>
+            <historyFetcher.Form method="post" action="?index">
+              <input type="hidden" name="_action" value="loadRuleHistory" />
+              <input type="hidden" name="cursorChangedAt" value={ruleHistory.at(-1)?.changedAt ?? ""} />
+              <input type="hidden" name="cursorId" value={ruleHistory.at(-1)?.id ?? ""} />
+              <button type="submit" style={secondaryBtn} disabled={historyFetcher.state !== "idle"}>
+                {historyFetcher.state === "submitting" ? t(lang, "loading") : t(lang, "loadMore")}
+              </button>
+            </historyFetcher.Form>
+          </div>
+        ) : null}
+      </section>
     </section>
   );
 }
@@ -1193,6 +1474,12 @@ function ruleTypeDescription(lang: Lang, type: RuleType) {
   return value === key ? "" : value;
 }
 
+function ruleStatusLabel(lang: Lang, status: RuleStatus) {
+  const key = `ruleStatus_${status}`;
+  const value = t(lang, key);
+  return value === key ? status : value;
+}
+
 function formatReasonLabel(reason: any, lang: Lang) {
   if (typeof reason === "string") return ruleTypeLabel(lang, reason as RuleType);
   if (reason && typeof reason === "object" && typeof reason.code === "string") {
@@ -1212,6 +1499,22 @@ function decisionLabel(lang: Lang, decision: string) {
   if (upper === "REVIEW") return t(lang, "decisionReview");
   if (upper === "HOLD") return t(lang, "decisionHold");
   return decision;
+}
+
+function formatRuleChangeSummary(entry: RuleChange, lang: Lang) {
+  if (!entry.changes.length) return t(lang, "noChangeDetails");
+  const parts = entry.changes.map((change) => {
+    const fieldLabel = t(lang, `change_${change.field}`);
+    const from = formatChangeValue(change.from, lang);
+    const to = formatChangeValue(change.to, lang);
+    return `${fieldLabel}: ${from} → ${to}`;
+  });
+  return parts.join("; ");
+}
+
+function formatChangeValue(value: string | null, lang: Lang) {
+  if (value === null || value === "") return t(lang, "emptyValue");
+  return value;
 }
 
 function orderIdFromGid(gid: string) {
@@ -1488,6 +1791,16 @@ const dangerBtn: React.CSSProperties = {
   fontSize: 12,
 };
 
+const secondaryBtn: React.CSSProperties = {
+  padding: "6px 10px",
+  borderRadius: 999,
+  border: "1px solid #dfe3e8",
+  background: "#ffffff",
+  cursor: "pointer",
+  fontWeight: 700,
+  fontSize: 12,
+};
+
 const primaryBtn: React.CSSProperties = {
   padding: "10px 12px",
   borderRadius: 12,
@@ -1500,7 +1813,7 @@ const primaryBtn: React.CSSProperties = {
 
 const formGrid: React.CSSProperties = {
   display: "grid",
-  gridTemplateColumns: "1.2fr 0.9fr 1.2fr 0.9fr 1.6fr auto",
+  gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
   gap: 10,
   alignItems: "end",
 };
@@ -1509,6 +1822,13 @@ const field: React.CSSProperties = {
   display: "flex",
   flexDirection: "column",
   gap: 6,
+};
+
+const cardInner: React.CSSProperties = {
+  border: "1px solid #e1e3e5",
+  borderRadius: 16,
+  padding: 14,
+  background: "#ffffff",
 };
 
 const label: React.CSSProperties = {
@@ -1553,6 +1873,18 @@ const cellControl: React.CSSProperties = {
 const cellControlNarrow: React.CSSProperties = {
   ...cellControl,
   textAlign: "right",
+};
+
+const cellGroup: React.CSSProperties = {
+  display: "grid",
+  gridTemplateColumns: "72px 1fr",
+  gap: 8,
+  alignItems: "center",
+};
+
+const cellControlCompact: React.CSSProperties = {
+  ...cellControl,
+  padding: "8px 8px",
 };
 
 function statusPill(kind: "idle" | "saving" | "saved" | "error"): React.CSSProperties {

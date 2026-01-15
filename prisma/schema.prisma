@@ -78,11 +78,36 @@ model RiskRule {
 
   action  String? // TAG:high_risk | HOLD | REVIEW
   enabled Boolean @default(true)
+  status  RuleStatus @default(ACTIVE)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
+  changes RiskRuleChange[]
+
   @@index([shop])
+  @@index([shop, status])
+}
+
+enum RuleStatus {
+  DRAFT
+  ACTIVE
+  DEPRECATED
+}
+
+model RiskRuleChange {
+  id String @id @default(cuid())
+  shop String
+  ruleId String
+  changedAt DateTime @default(now())
+  changedBy String
+  changedByType String
+  changes Json
+
+  rule RiskRule @relation(fields: [ruleId], references: [id])
+
+  @@index([shop, changedAt])
+  @@index([ruleId, changedAt])
 }
 
 enum RiskEventSource {
