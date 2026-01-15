@@ -44,6 +44,8 @@ type RiskEventRow = {
   decision: string | null;
   skipReason: string | null;
   orderAdminUrl: string | null; // ✅ добавили ссылку
+  rulesVersion: string | null;
+  rulesSnapshot: any[] | null;
 };
 
 type Row = {
@@ -57,6 +59,7 @@ type Row = {
   updatedAt: string;
   orderAdminUrl: string | null;
   rulesVersion: string | null;
+  rulesSnapshot: any[] | null;
 
   // trust
   lastTopic: string | null;
@@ -146,7 +149,13 @@ export async function loader({ request }: LoaderFunctionArgs) {
   const orderGids = items.map((it) => it.orderGid);
   const latestEventsByOrder = new Map<
     string,
-    { decision: string | null; skipReason: string | null; reasonsJson: string | null; rulesVersion: string | null }
+    {
+      decision: string | null;
+      skipReason: string | null;
+      reasonsJson: string | null;
+      rulesVersion: string | null;
+      rulesSnapshot: any[] | null;
+    }
   >();
 
   if (orderGids.length > 0) {
@@ -164,6 +173,9 @@ export async function loader({ request }: LoaderFunctionArgs) {
           skipReason: skipReason ?? normalizeSkipReason((event as any).skipReason) ?? null,
           reasonsJson: reasonsFromEvent ? JSON.stringify(reasonsFromEvent) : (event as any).reasonsJson ?? null,
           rulesVersion: (event as any).rulesVersion ?? null,
+          rulesSnapshot: Array.isArray((event as any).rulesSnapshot)
+            ? ((event as any).rulesSnapshot as any[])
+            : null,
         });
       }
     }
@@ -172,8 +184,9 @@ export async function loader({ request }: LoaderFunctionArgs) {
   // recent events (if model exists)
   let events: any[] = [];
   try {
+    const eventWhere: any = { shop: session.shop };
     events = await prisma.riskEvent.findMany({
-      where: { shop: session.shop },
+      where: eventWhere,
       orderBy: { createdAt: "desc" },
       take: 20,
     });
@@ -210,34 +223,36 @@ export async function loader({ request }: LoaderFunctionArgs) {
       }),
     ),
 
-   events: events.map(
-  (e): RiskEventRow => {
-    const orderId = orderIdFromGid(e.orderGid);
-    const orderAdminUrl = orderId ? shopifyAdminOrderUrl(session.shop, orderId) : null;
+    events: events.map(
+      (e): RiskEventRow => {
+        const orderId = orderIdFromGid(e.orderGid);
+        const orderAdminUrl = orderId ? shopifyAdminOrderUrl(session.shop, orderId) : null;
 
-    const timeIso = e.createdAt ? e.createdAt.toISOString() : null;
+        const timeIso = e.createdAt ? e.createdAt.toISOString() : null;
 
-    return {
-      id: e.id,
-      orderGid: e.orderGid,
+        return {
+          id: e.id,
+          orderGid: e.orderGid,
 
-      // UI обычно ждёт orderName — оставим, но берём из orderNumber
-      orderName: (e as any).orderNumber ?? null,
+          // UI обычно ждёт orderName — оставим, но берём из orderNumber
+          orderName: (e as any).orderNumber ?? null,
 
-      topic: e.topic,
+          topic: e.topic,
 
-      // оставляем для совместимости/других мест
-      eventAt: timeIso,
+          // оставляем для совместимости/других мест
+          eventAt: timeIso,
 
-      decision: e.decision ?? null,
-      skipReason:
-        normalizeSkipReason((e as any)?.reasons?.summary ?? null) ??
-        normalizeSkipReason((e as any).skipReason) ??
-        null,
-      orderAdminUrl,
-    };
-  },
-),
+          decision: e.decision ?? null,
+          skipReason:
+            normalizeSkipReason((e as any)?.reasons?.summary ?? null) ??
+            normalizeSkipReason((e as any).skipReason) ??
+            null,
+          orderAdminUrl,
+          rulesVersion: (e as any).rulesVersion ?? null,
+          rulesSnapshot: Array.isArray((e as any).rulesSnapshot) ? ((e as any).rulesSnapshot as any[]) : null,
+        };
+      },
+    ),
 
 
 
@@ -260,6 +275,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
           updatedAt: it.updatedAt.toISOString(),
           orderAdminUrl,
           rulesVersion: latestEvent?.rulesVersion ?? null,
+          rulesSnapshot: latestEvent?.rulesSnapshot ?? null,
 
           // trust (field-safe during migration)
           lastTopic: (it as any).lastTopic ?? null,
@@ -703,6 +719,7 @@ export default function AppIndex() {
   const level = (params.get("level") ?? "ALL").toUpperCase();
   const focusedRuleId = params.get("ruleId");
   const [openFactorId, setOpenFactorId] = useState<string | null>(null);
+  const [openRulesetId, setOpenRulesetId] = useState<string | null>(null);
   const simulateFetcher = useFetcher<ActionData>();
   const [simulationByOrder, setSimulationByOrder] = useState<Record<string, any>>({});
   const simLoadingOrderGid = simulateFetcher.formData?.get("orderGid");
@@ -733,6 +750,7 @@ export default function AppIndex() {
     p.set("lang", next);
     setParams(p);
   };
+
 
   return (
     <div style={page}>
@@ -897,13 +915,43 @@ export default function AppIndex() {
                             </div>
                           ) : null}
                           <div style={{ marginTop: 2, fontSize: 12, color: "#6d7175" }}>
-                            {t(lang, "rulesVersionLabel")}:{" "}
                             {r.rulesVersion ? (
-                              <code style={codeInline} title={r.rulesVersion}>
-                                {shortRulesVersion(r.rulesVersion)}
-                              </code>
+                              <>
+                                {t(lang, "evaluatedWithRuleset")}{" "}
+                                {Array.isArray(r.rulesSnapshot) ? (
+                                  <span style={{ position: "relative", display: "inline-flex" }}>
+                                    <span
+                                      style={popoverTrigger}
+                                      tabIndex={0}
+                                      onClick={() =>
+                                        setOpenRulesetId(openRulesetId === r.id ? null : r.id)
+                                      }
+                                      onBlur={() => {
+                                        window.setTimeout(() => setOpenRulesetId(null), 0);
+                                      }}
+                                    >
+                                      <code style={codeInline} title={r.rulesVersion}>
+                                        v{shortRulesVersion(r.rulesVersion)}
+                                      </code>
+                                    </span>
+                                    {openRulesetId === r.id ? (
+                                      <div style={popoverCard}>
+                                        {rulesetPopoverLines(r.rulesSnapshot, lang).map((line) => (
+                                          <div key={line} style={popoverLine}>
+                                            {line}
+                                          </div>
+                                        ))}
+                                      </div>
+                                    ) : null}
+                                  </span>
+                                ) : (
+                                  <code style={codeInline} title={r.rulesVersion}>
+                                    v{shortRulesVersion(r.rulesVersion)}
+                                  </code>
+                                )}
+                              </>
                             ) : (
-                              <span style={subtle}>—</span>
+                              <span style={subtle}>{t(lang, "rulesetUnknown")}</span>
                             )}
                           </div>
                         </td>
@@ -984,7 +1032,12 @@ export default function AppIndex() {
       ) : tab === "rules" ? (
         <RulesInline data={data} lang={lang} focusedRuleId={focusedRuleId} />
       ) : (
-        <EventsTab data={data} lang={lang} />
+        <EventsTab
+          data={data}
+          lang={lang}
+          openRulesetId={openRulesetId}
+          setOpenRulesetId={setOpenRulesetId}
+        />
       )}
     </div>
   );
@@ -1230,8 +1283,15 @@ function RulesInline({
             </thead>
 
             <tbody>
-              {localRules.map((r) => (
-                <tr key={r.id} id={`rule-${r.id}`} style={focusedRuleId === r.id ? ruleFocusRow : undefined}>
+              {localRules.map((r) => {
+                const rowStyle =
+                  r.status === "DEPRECATED"
+                    ? { ...ruleDeprecatedRow, ...(focusedRuleId === r.id ? ruleFocusRow : {}) }
+                    : focusedRuleId === r.id
+                      ? ruleFocusRow
+                      : undefined;
+                return (
+                <tr key={r.id} id={`rule-${r.id}`} style={rowStyle}>
                   <td style={td}>
                     <button
                       type="button"
@@ -1256,6 +1316,7 @@ function RulesInline({
                         </option>
                       ))}
                     </select>
+                    {r.status === "DEPRECATED" ? <span style={deprecatedBadge}>{t(lang, "deprecated")}</span> : null}
                   </td>
 
                   <td style={td}>
@@ -1331,7 +1392,7 @@ function RulesInline({
                     </button>
                   </td>
                 </tr>
-              ))}
+              )})}
             </tbody>
           </table>
         </div>
@@ -1469,7 +1530,17 @@ function RulesInline({
 
 /* ---------- Events tab (✅ теперь тут Recent events блок) ---------- */
 
-function EventsTab({ data, lang }: { data: LoaderData; lang: Lang }) {
+function EventsTab({
+  data,
+  lang,
+  openRulesetId,
+  setOpenRulesetId,
+}: {
+  data: LoaderData;
+  lang: Lang;
+  openRulesetId: string | null;
+  setOpenRulesetId: (next: string | null) => void;
+}) {
   return (
     <section style={card}>
       <div style={cardHeaderRow}>
@@ -1492,6 +1563,7 @@ function EventsTab({ data, lang }: { data: LoaderData; lang: Lang }) {
                 <th style={th}>{t(lang, "evTopic")}</th>
                 <th style={th}>{t(lang, "evOrder")}</th>
                 <th style={th}>{t(lang, "evDecision")}</th>
+                <th style={th}>{t(lang, "rulesVersionLabel")}</th>
                 <th style={th}>{t(lang, "thLink")}</th>
               </tr>
             </thead>
@@ -1514,6 +1586,44 @@ function EventsTab({ data, lang }: { data: LoaderData; lang: Lang }) {
 
                   <td style={td}>
                     <DecisionDisplay decision={e.decision} skipReason={e.skipReason} lang={lang} />
+                  </td>
+
+                  <td style={td}>
+                    {e.rulesVersion ? (
+                      Array.isArray(e.rulesSnapshot) ? (
+                        <span style={{ position: "relative", display: "inline-flex" }}>
+                          <span
+                            style={popoverTrigger}
+                            tabIndex={0}
+                            onClick={() =>
+                              setOpenRulesetId(openRulesetId === e.id ? null : e.id)
+                            }
+                            onBlur={() => {
+                              window.setTimeout(() => setOpenRulesetId(null), 0);
+                            }}
+                          >
+                            <code style={codeInline} title={e.rulesVersion}>
+                              v{shortRulesVersion(e.rulesVersion)}
+                            </code>
+                          </span>
+                          {openRulesetId === e.id ? (
+                            <div style={popoverCard}>
+                              {rulesetPopoverLines(e.rulesSnapshot, lang).map((line) => (
+                                <div key={line} style={popoverLine}>
+                                  {line}
+                                </div>
+                              ))}
+                            </div>
+                          ) : null}
+                        </span>
+                      ) : (
+                        <code style={codeInline} title={e.rulesVersion}>
+                          v{shortRulesVersion(e.rulesVersion)}
+                        </code>
+                      )
+                    ) : (
+                      <span style={subtle}>—</span>
+                    )}
                   </td>
 
                   <td style={td}>
@@ -1744,6 +1854,24 @@ function factorPopoverLines(reason: any, lang: Lang) {
     `${t(lang, "points")}: ${info.weight || t(lang, "emptyValue")}`,
     `${t(lang, "action")}: ${action}`,
   ];
+}
+
+function rulesetPopoverLines(snapshot: any[] | null, lang: Lang) {
+  if (!Array.isArray(snapshot)) return [];
+  if (snapshot.length === 0) return [t(lang, "rulesetEmpty")];
+  return snapshot.map((rule) => {
+    const ruleKey = typeof rule?.ruleKey === "string" ? rule.ruleKey : "";
+    const typeLabel = ruleKey ? ruleTypeLabel(lang, ruleKey as RuleType) : t(lang, "emptyValue");
+    const operator = typeof rule?.params?.operator === "string" ? rule.params.operator : "";
+    const value = typeof rule?.params?.value === "string" ? rule.params.value : "";
+    const threshold = operator && value ? `${operator} ${value}` : t(lang, "emptyValue");
+    const weight = Number.isFinite(rule?.weight) ? String(rule.weight) : t(lang, "emptyValue");
+    const action = rule?.action ? String(rule.action) : t(lang, "emptyValue");
+    const enabled = rule?.enabled ? t(lang, "on") : t(lang, "off");
+    return `${typeLabel} | ${t(lang, "threshold")}: ${threshold} | ${t(lang, "points")}: ${weight} | ${
+      t(lang, "action")
+    }: ${action} | ${enabled}`;
+  });
 }
 
 function riskLevelLabel(lang: Lang, level: Row["riskLevel"]) {
@@ -2146,6 +2274,26 @@ const cardInner: React.CSSProperties = {
 
 const ruleFocusRow: React.CSSProperties = {
   background: "#fff5ea",
+};
+
+const ruleDeprecatedRow: React.CSSProperties = {
+  background: "#f3f4f5",
+  color: "#5f6368",
+};
+
+const deprecatedBadge: React.CSSProperties = {
+  display: "inline-flex",
+  alignItems: "center",
+  marginLeft: 8,
+  padding: "2px 8px",
+  borderRadius: 999,
+  fontSize: 11,
+  fontWeight: 800,
+  textTransform: "uppercase",
+  letterSpacing: "0.04em",
+  border: "1px solid #eadab8",
+  background: "#fff5dd",
+  color: "#7a4a00",
 };
 
 const simulationBox: React.CSSProperties = {

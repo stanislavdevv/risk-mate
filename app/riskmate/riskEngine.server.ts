@@ -3,7 +3,7 @@ import { evaluateRules, type RuleFactor } from "./rules.engine";
 import { calculateRiskLevel } from "./riskLevel";
 import type { RiskLevel } from "./types";
 import { decisionFromRiskLevel, type Decision } from "./decision";
-import { computeRulesVersion } from "./rulesetVersion.server";
+import { buildRulesetSnapshot, computeRulesVersion } from "./rulesetVersion.server";
 
 const SCORE_MIN = 0;
 const SCORE_MAX = 100;
@@ -110,12 +110,14 @@ export async function computeRiskFromWebhookPayload(
   tags: string[]; // keep for compatibility, but MVP-minimal
   facts: { description: string; sentiment: "NEGATIVE" | "NEUTRAL" | "POSITIVE" }[];
   rulesVersion: string;
+  rulesSnapshot: ReturnType<typeof buildRulesetSnapshot>;
 }> {
   const rules = await prisma.riskRule.findMany({
     where: { shop, status: "ACTIVE" },
     orderBy: { createdAt: "asc" },
   });
   const rulesVersion = computeRulesVersion(rules);
+  const rulesSnapshot = buildRulesetSnapshot(rules);
   const enabledRules = rules.filter((rule) => rule.enabled);
 
   const orderTotal = Number((payload as any)?.current_total_price ?? 0);
@@ -197,6 +199,7 @@ export async function computeRiskFromWebhookPayload(
     tags: Array.from(tags),
     facts,
     rulesVersion,
+    rulesSnapshot,
   };
 }
 
@@ -215,6 +218,7 @@ export async function computeRiskFromSnapshot(
     orderBy: { createdAt: "asc" },
   });
   const rulesVersion = computeRulesVersion(rules);
+  const rulesSnapshot = buildRulesetSnapshot(rules);
   const enabledRules = rules.filter((rule) => rule.enabled);
 
   const orderTotal = Number(snapshot?.total ?? 0);
@@ -276,5 +280,6 @@ export async function computeRiskFromSnapshot(
     tags: Array.from(tags),
     facts,
     rulesVersion,
+    rulesSnapshot,
   };
 }
