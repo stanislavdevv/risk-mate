@@ -25,7 +25,7 @@ type Rule = {
 type RiskEventRow = {
   id: string;
   orderGid: string;
-  orderName: string;
+  orderName: string | null;
   topic: string;
   eventAt: string;
   decision: string | null;
@@ -75,7 +75,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
     query { shop { currencyCode } }
   `);
   const shopJson = await shopRes.json();
-  const currency = shopJson?.data?.shop?.currencyCode ?? "UNKNOWN";
+  const currency = shopJson?.data?.shop?.currencyCode ?? t(lang, "currencyUnknown");
 
   const tab = (url.searchParams.get("tab") ?? "orders").toLowerCase();
   const level = (url.searchParams.get("level") ?? "ALL").toUpperCase();
@@ -103,15 +103,17 @@ export async function loader({ request }: LoaderFunctionArgs) {
   if (orderGids.length > 0) {
     const orderEvents = await prisma.riskEvent.findMany({
       where: { shop: session.shop, orderGid: { in: orderGids } },
-      orderBy: [{ eventAt: "desc" }, { createdAt: "desc" }],
+      orderBy: [{ createdAt: "desc" }],
     });
 
     for (const event of orderEvents) {
       if (!latestEventsByOrder.has(event.orderGid)) {
+        const skipReason = normalizeSkipReason((event as any)?.reasons?.summary ?? null);
+        const reasonsFromEvent = extractReasonsArray((event as any)?.reasons);
         latestEventsByOrder.set(event.orderGid, {
           decision: event.decision ?? null,
-          skipReason: event.skipReason ?? null,
-          reasonsJson: (event as any).reasonsJson ?? null,
+          skipReason: skipReason ?? normalizeSkipReason((event as any).skipReason) ?? null,
+          reasonsJson: reasonsFromEvent ? JSON.stringify(reasonsFromEvent) : (event as any).reasonsJson ?? null,
         });
       }
     }
@@ -158,7 +160,6 @@ export async function loader({ request }: LoaderFunctionArgs) {
   (e): RiskEventRow => {
     const orderId = orderIdFromGid(e.orderGid);
     const orderAdminUrl = orderId ? shopifyAdminOrderUrl(session.shop, orderId) : null;
-    console.log(e.createdAt);
 
     const timeIso = e.createdAt ? e.createdAt.toISOString() : null;
 
@@ -175,7 +176,10 @@ export async function loader({ request }: LoaderFunctionArgs) {
       eventAt: timeIso,
 
       decision: e.decision ?? null,
-      skipReason: (e as any)?.reasons?.summary ?? null,
+      skipReason:
+        normalizeSkipReason((e as any)?.reasons?.summary ?? null) ??
+        normalizeSkipReason((e as any).skipReason) ??
+        null,
       orderAdminUrl,
     };
   },
@@ -188,7 +192,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
         const orderId = orderIdFromGid(it.orderGid);
         const orderAdminUrl = orderId ? shopifyAdminOrderUrl(session.shop, orderId) : null;
         const latestEvent = latestEventsByOrder.get(it.orderGid);
-        const reasonsSource = latestEvent?.reasonsJson ?? it.reasonsJson;
+        const reasonsSource = it.reasonsJson ?? latestEvent?.reasonsJson;
         const reasons = reasonsSource ? safeJsonParse(reasonsSource) : [];
 
         return {
@@ -208,7 +212,10 @@ export async function loader({ request }: LoaderFunctionArgs) {
           eventCount: Number((it as any).eventCount ?? 0),
           lastRiskChangeAt: (it as any).lastRiskChangeAt ? (it as any).lastRiskChangeAt.toISOString() : null,
           lastDecision: latestEvent?.decision ?? (it as any).lastDecision ?? null,
-          skipReason: latestEvent?.skipReason ?? (it as any).skipReason ?? null,
+          skipReason:
+            normalizeSkipReason(latestEvent?.skipReason ?? null) ??
+            normalizeSkipReason((it as any).skipReason) ??
+            null,
         };
       },
     ),
@@ -219,6 +226,8 @@ export async function loader({ request }: LoaderFunctionArgs) {
 
 export async function action({ request }: ActionFunctionArgs) {
   const { session } = await authenticate.admin(request);
+  const url = new URL(request.url);
+  const lang = parseLang(url.searchParams.get("lang"));
   const form = await request.formData();
   const intent = String(form.get("_action") ?? "");
 
@@ -227,14 +236,14 @@ export async function action({ request }: ActionFunctionArgs) {
 
   const validate = (p: { type: string; operator: string; value: string; points: number }): string[] => {
     const errors: string[] = [];
-    if (!allowedTypes.includes(p.type as RuleType)) errors.push("Unsupported rule type");
-    if (!allowedOps.includes(p.operator as RuleOp)) errors.push("Unsupported operator");
-    if (!p.value) errors.push("Value is required");
-    if (!Number.isFinite(p.points)) errors.push("Points must be a number");
+    if (!allowedTypes.includes(p.type as RuleType)) errors.push(t(lang, "errorUnsupportedRuleType"));
+    if (!allowedOps.includes(p.operator as RuleOp)) errors.push(t(lang, "errorUnsupportedOperator"));
+    if (!p.value) errors.push(t(lang, "errorValueRequired"));
+    if (!Number.isFinite(p.points)) errors.push(t(lang, "errorPointsNumber"));
 
     if (p.type === "FIRST_TIME") {
       const v = p.value.toLowerCase();
-      if (v !== "true" && v !== "false") errors.push("FIRST_TIME value must be true or false");
+      if (v !== "true" && v !== "false") errors.push(t(lang, "errorFirstTimeBool"));
     }
     return errors;
   };
@@ -243,7 +252,7 @@ export async function action({ request }: ActionFunctionArgs) {
   if (intent === "seedDefaultRules") {
     const existingCount = await prisma.riskRule.count({ where: { shop: session.shop } });
     if (existingCount > 0) {
-      return json<ActionData>({ ok: false, error: "Defaults can be added only when there are no rules." }, 400);
+      return json<ActionData>({ ok: false, error: t(lang, "errorDefaultsOnlyNoRules") }, 400);
     }
 
     const defaults: Array<{
@@ -344,10 +353,10 @@ export async function action({ request }: ActionFunctionArgs) {
     const pointsRaw = String(form.get("points") ?? "").trim();
     const actionValue = String(form.get("action") ?? "").trim();
 
-    if (!id) return json<ActionData>({ ok: false, error: "Missing id" }, 400);
+    if (!id) return json<ActionData>({ ok: false, error: t(lang, "errorMissingId") }, 400);
 
     const exists = await prisma.riskRule.findFirst({ where: { id, shop: session.shop } });
-    if (!exists) return json<ActionData>({ ok: false, error: "Rule not found" }, 404);
+    if (!exists) return json<ActionData>({ ok: false, error: t(lang, "errorRuleNotFound") }, 404);
 
     const points = Number(pointsRaw);
     const errors = validate({ type, operator, value, points });
@@ -370,10 +379,10 @@ export async function action({ request }: ActionFunctionArgs) {
   if (intent === "toggleRule") {
     const id = String(form.get("id") ?? "").trim();
     const enabled = String(form.get("enabled") ?? "") === "true";
-    if (!id) return json<ActionData>({ ok: false, error: "Missing rule id" }, 400);
+    if (!id) return json<ActionData>({ ok: false, error: t(lang, "errorMissingRuleId") }, 400);
 
     const rule = await prisma.riskRule.findFirst({ where: { id, shop: session.shop } });
-    if (!rule) return json<ActionData>({ ok: false, error: "Rule not found" }, 404);
+    if (!rule) return json<ActionData>({ ok: false, error: t(lang, "errorRuleNotFound") }, 404);
 
     await prisma.riskRule.update({ where: { id }, data: { enabled } });
     return json<ActionData>({ ok: true, op: "toggleRule", id, enabled });
@@ -381,16 +390,16 @@ export async function action({ request }: ActionFunctionArgs) {
 
   if (intent === "deleteRule") {
     const id = String(form.get("id") ?? "").trim();
-    if (!id) return json<ActionData>({ ok: false, error: "Missing rule id" }, 400);
+    if (!id) return json<ActionData>({ ok: false, error: t(lang, "errorMissingRuleId") }, 400);
 
     const rule = await prisma.riskRule.findFirst({ where: { id, shop: session.shop } });
-    if (!rule) return json<ActionData>({ ok: false, error: "Rule not found" }, 404);
+    if (!rule) return json<ActionData>({ ok: false, error: t(lang, "errorRuleNotFound") }, 404);
 
     await prisma.riskRule.delete({ where: { id } });
     return json<ActionData>({ ok: true, op: "deleteRule", id });
   }
 
-  return json<ActionData>({ ok: false, error: "Unknown action" }, 400);
+  return json<ActionData>({ ok: false, error: t(lang, "errorUnknownAction") }, 400);
 }
 
 /* ---------- component ---------- */
@@ -540,7 +549,7 @@ export default function AppIndex() {
                         <td style={td}>{r.score}</td>
 
                         <td style={td}>
-                          <span style={riskPill(r.riskLevel)}>{r.riskLevel}</span>
+                          <span style={riskPill(r.riskLevel)}>{riskLevelLabel(lang, r.riskLevel)}</span>
                         </td>
 
                         <td style={td}>
@@ -548,7 +557,7 @@ export default function AppIndex() {
                             <ul style={{ margin: 0, paddingLeft: 18 }}>
                               {r.reasons.slice(0, 3).map((x: any, i: number) => (
                                 <li key={i}>
-                                  <code style={codeInline}>{typeof x === "string" ? x : x.code ?? "REASON"}</code>
+                                  <code style={codeInline}>{formatReasonLabel(x, lang)}</code>
                                   {typeof x === "object" && x.details ? ` — ${x.details}` : ""}
                                 </li>
                               ))}
@@ -604,6 +613,8 @@ function RulesInline({ data, lang }: { data: LoaderData; lang: Lang }) {
   const allowedTypes: RuleType[] = ["ORDER_VALUE", "FIRST_TIME", "HIGH_QTY", "COUNTRY_MISMATCH"];
   const allowedOps: RuleOp[] = [">", ">=", "=", "!=", "<", "<="];
 
+  const [newRuleType, setNewRuleType] = useState<RuleType>("ORDER_VALUE");
+
   const [ui, setUi] = useState<{ state: "idle" | "saving" | "saved" | "error"; msg?: string }>({ state: "idle" });
 
   const statusLabel = useMemo(() => {
@@ -632,6 +643,7 @@ function RulesInline({ data, lang }: { data: LoaderData; lang: Lang }) {
     if (!d || !d.ok || d.op !== "addRule") return;
     setLocalRules((prev) => [d.rule, ...prev]);
     addFormRef.current?.reset();
+    setNewRuleType("ORDER_VALUE");
     setUi({ state: "saved" });
     window.setTimeout(() => setUi((s) => (s.state === "saved" ? { state: "idle" } : s)), 900);
   }, [addFetcher.data]);
@@ -800,12 +812,13 @@ function RulesInline({ data, lang }: { data: LoaderData; lang: Lang }) {
                     <select
                       value={r.type}
                       style={cellControl}
+                      title={ruleTypeDescription(lang, r.type) || ruleTypeLabel(lang, r.type)}
                       onChange={(e) => updateRuleLocal(r.id, { type: e.target.value as RuleType })}
                       onBlur={() => scheduleSave(r, true)}
                     >
                       {allowedTypes.map((tt) => (
                         <option key={tt} value={tt}>
-                          {tt}
+                          {ruleTypeLabel(lang, tt)}
                         </option>
                       ))}
                     </select>
@@ -849,9 +862,9 @@ function RulesInline({ data, lang }: { data: LoaderData; lang: Lang }) {
                   </td>
 
                   <td style={td}>
-                    <input
-                      value={r.action ?? ""}
-                      placeholder="REVIEW / HOLD / TAG:foo"
+                      <input
+                        value={r.action ?? ""}
+                        placeholder={t(lang, "actionPlaceholderInline")}
                       style={cellControl}
                       onChange={(e) => updateRuleLocal(r.id, { action: e.target.value || null })}
                       onBlur={() => scheduleSave(r, true)}
@@ -883,12 +896,22 @@ function RulesInline({ data, lang }: { data: LoaderData; lang: Lang }) {
 
         <label style={field}>
           <span style={label}>{t(lang, "type")}</span>
-          <select name="type" defaultValue="ORDER_VALUE" style={control}>
-            <option value="ORDER_VALUE">ORDER_VALUE</option>
-            <option value="FIRST_TIME">FIRST_TIME</option>
-            <option value="HIGH_QTY">HIGH_QTY</option>
-            <option value="COUNTRY_MISMATCH">COUNTRY_MISMATCH</option>
+          <select
+            name="type"
+            value={newRuleType}
+            style={control}
+            title={ruleTypeDescription(lang, newRuleType) || ruleTypeLabel(lang, newRuleType)}
+            onChange={(e) => setNewRuleType(e.target.value as RuleType)}
+          >
+            {allowedTypes.map((tt) => (
+              <option key={tt} value={tt}>
+                {ruleTypeLabel(lang, tt)}
+              </option>
+            ))}
           </select>
+          {ruleTypeDescription(lang, newRuleType) ? (
+            <div style={{ ...subtle, marginTop: 6 }}>{ruleTypeDescription(lang, newRuleType)}</div>
+          ) : null}
         </label>
 
         <label style={field}>
@@ -905,17 +928,17 @@ function RulesInline({ data, lang }: { data: LoaderData; lang: Lang }) {
 
         <label style={field}>
           <span style={label}>{t(lang, "value")}</span>
-          <input name="value" placeholder="300 / true / DE" style={control} />
+          <input name="value" placeholder={t(lang, "valuePlaceholder")} style={control} />
         </label>
 
         <label style={field}>
           <span style={label}>{t(lang, "points")}</span>
-          <input name="points" placeholder="15" defaultValue="15" style={control} />
+          <input name="points" placeholder={t(lang, "pointsPlaceholder")} defaultValue="15" style={control} />
         </label>
 
         <label style={field}>
           <span style={label}>{t(lang, "action")}</span>
-          <input name="action" placeholder="TAG:high_value / REVIEW / HOLD" style={control} />
+          <input name="action" placeholder={t(lang, "actionPlaceholderAdd")} style={control} />
         </label>
 
         <div style={{ display: "flex", alignItems: "end" }}>
@@ -932,8 +955,10 @@ function RulesInline({ data, lang }: { data: LoaderData; lang: Lang }) {
       ) : null}
 
       <div style={{ marginTop: 10, fontSize: 13, color: "#6d7175" }}>
-        {t(lang, "examples")}: <code style={codeInline}>FIRST_TIME = true</code>,{" "}
-        <code style={codeInline}>ORDER_VALUE &gt; 300</code>, <code style={codeInline}>REVIEW</code>.
+        {t(lang, "examples")}:{" "}
+        <code style={codeInline}>{`${ruleTypeLabel(lang, "FIRST_TIME")} = true`}</code>,{" "}
+        <code style={codeInline}>{`${ruleTypeLabel(lang, "ORDER_VALUE")} > 300`}</code>,{" "}
+        <code style={codeInline}>REVIEW</code>.
       </div>
     </section>
   );
@@ -1110,6 +1135,63 @@ function safeJsonParse(s: string) {
   }
 }
 
+function normalizeSkipReason(raw: unknown) {
+  const s = typeof raw === "string" ? raw.trim() : "";
+  if (!s) return null;
+  const upper = s.toUpperCase();
+  if (upper === "UNCHANGED" || upper === "OUT_OF_ORDER" || upper === "NO_RULES") return upper;
+  const lower = s.toLowerCase();
+  if (lower.includes("unchanged")) return "UNCHANGED";
+  if (lower.includes("out of order")) return "OUT_OF_ORDER";
+  if (lower.includes("no rules")) return "NO_RULES";
+  if (/^skipped\b/i.test(s)) return s;
+  return s;
+}
+
+function extractReasonsArray(reasons: any) {
+  if (!reasons || typeof reasons !== "object") return null;
+  if (Array.isArray(reasons)) return reasons;
+  if (Array.isArray((reasons as any).factors)) {
+    return (reasons as any).factors
+      .map((f: any) => (typeof f?.label === "string" ? f.label : null))
+      .filter((x: string | null) => x);
+  }
+  return null;
+}
+
+function ruleTypeLabel(lang: Lang, type: RuleType) {
+  const key = `ruleType_${type}`;
+  const value = t(lang, key);
+  return value === key ? type : value;
+}
+
+function ruleTypeDescription(lang: Lang, type: RuleType) {
+  const key = `ruleType_${type}_desc`;
+  const value = t(lang, key);
+  return value === key ? "" : value;
+}
+
+function formatReasonLabel(reason: any, lang: Lang) {
+  if (typeof reason === "string") return ruleTypeLabel(lang, reason as RuleType);
+  if (reason && typeof reason === "object" && typeof reason.code === "string") {
+    return ruleTypeLabel(lang, reason.code as RuleType);
+  }
+  return t(lang, "reasonFallback");
+}
+
+function riskLevelLabel(lang: Lang, level: Row["riskLevel"]) {
+  const key = level.toLowerCase();
+  return t(lang, key);
+}
+
+function decisionLabel(lang: Lang, decision: string) {
+  const upper = decision.toUpperCase();
+  if (upper === "ALLOW") return t(lang, "decisionAllow");
+  if (upper === "REVIEW") return t(lang, "decisionReview");
+  if (upper === "HOLD") return t(lang, "decisionHold");
+  return decision;
+}
+
 function orderIdFromGid(gid: string) {
   const m = gid.match(/\/Order\/(\d+)$/);
   return m?.[1] ?? null;
@@ -1145,6 +1227,12 @@ function skipTooltip(skipReason: string, lang: Lang) {
   if (skipReason === "UNCHANGED") {
     return t(lang, "skippedTooltipUnchanged");
   }
+  if (skipReason === "OUT_OF_ORDER") {
+    return t(lang, "skippedTooltipOutOfOrder");
+  }
+  if (skipReason === "NO_RULES") {
+    return t(lang, "skippedTooltipNoRules");
+  }
   return t(lang, "skippedTooltipGeneric", { reason: skipReason });
 }
 
@@ -1159,7 +1247,7 @@ function DecisionDisplay({
 }) {
   return (
     <span style={decisionInline}>
-      <code style={codeInline}>{decision ?? "—"}</code>
+      <code style={codeInline}>{decision ? decisionLabel(lang, decision) : "—"}</code>
       {skipReason ? (
         <span style={skipBadge} title={skipTooltip(skipReason, lang)}>
           ⏭️ {t(lang, "skipped")}

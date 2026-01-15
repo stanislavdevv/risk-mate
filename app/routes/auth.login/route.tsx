@@ -5,18 +5,24 @@ import { Form, useActionData, useLoaderData } from "react-router";
 
 import { login } from "../../shopify.server";
 import { loginErrorMessage } from "./error.server";
+import { parseLang, t, type Lang } from "../../i18n/strings";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
-  const errors = loginErrorMessage(await login(request));
+  const url = new URL(request.url);
+  const lang = parseLang(url.searchParams.get("lang"));
+  const errors = loginErrorMessage(await login(request), lang);
 
-  return { errors };
+  return { errors, lang };
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
-  const errors = loginErrorMessage(await login(request));
+  const url = new URL(request.url);
+  const lang = parseLang(url.searchParams.get("lang"));
+  const errors = loginErrorMessage(await login(request), lang);
 
   return {
     errors,
+    lang,
   };
 };
 
@@ -25,22 +31,23 @@ export default function Auth() {
   const actionData = useActionData<typeof action>();
   const [shop, setShop] = useState("");
   const { errors } = actionData || loaderData;
+  const lang = (actionData?.lang ?? loaderData.lang) as Lang;
 
   return (
     <AppProvider embedded={false}>
       <s-page>
         <Form method="post">
-        <s-section heading="Log in">
+        <s-section heading={t(lang, "loginTitle")}>
           <s-text-field
             name="shop"
-            label="Shop domain"
-            details="example.myshopify.com"
+            label={t(lang, "shopDomainLabel")}
+            details={t(lang, "shopDomainDetails")}
             value={shop}
             onChange={(e) => setShop(e.currentTarget.value)}
             autocomplete="on"
             error={errors.shop}
           ></s-text-field>
-          <s-button type="submit">Log in</s-button>
+          <s-button type="submit">{t(lang, "loginButton")}</s-button>
         </s-section>
         </Form>
       </s-page>

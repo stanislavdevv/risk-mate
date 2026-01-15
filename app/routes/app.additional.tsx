@@ -1,33 +1,38 @@
+import { useSearchParams } from "react-router";
+import { parseLang, t } from "../i18n/strings";
+
 export default function AdditionalPage() {
+  const [params] = useSearchParams();
+  const lang = parseLang(params.get("lang"));
+
   return (
-    <s-page heading="Additional page">
-      <s-section heading="Multiple pages">
+    <s-page heading={t(lang, "additionalHeading")}>
+      <s-section heading={t(lang, "additionalSectionHeading")}>
         <s-paragraph>
-          The app template comes with an additional page which demonstrates how
-          to create multiple pages within app navigation using{" "}
+          {t(lang, "additionalPara1Before")}{" "}
           <s-link
             href="https://shopify.dev/docs/apps/tools/app-bridge"
             target="_blank"
           >
-            App Bridge
+            {t(lang, "additionalPara1Link")}
           </s-link>
-          .
+          {t(lang, "additionalPara1After")}
         </s-paragraph>
         <s-paragraph>
-          To create your own page and have it show up in the app navigation, add
-          a page inside <code>app/routes</code>, and a link to it in the{" "}
-          <code>&lt;ui-nav-menu&gt;</code> component found in{" "}
-          <code>app/routes/app.jsx</code>.
+          {t(lang, "additionalPara2Before")} <code>app/routes</code>,{" "}
+          {t(lang, "additionalPara2Between")} <code>&lt;ui-nav-menu&gt;</code>{" "}
+          {t(lang, "additionalPara2After")} <code>app/routes/app.jsx</code>
+          {t(lang, "additionalPara2End")}
         </s-paragraph>
       </s-section>
-      <s-section slot="aside" heading="Resources">
+      <s-section slot="aside" heading={t(lang, "additionalResourcesHeading")}>
         <s-unordered-list>
           <s-list-item>
             <s-link
               href="https://shopify.dev/docs/apps/design-guidelines/navigation#app-nav"
               target="_blank"
             >
-              App nav best practices
+              {t(lang, "additionalResourcesLink")}
             </s-link>
           </s-list-item>
         </s-unordered-list>
