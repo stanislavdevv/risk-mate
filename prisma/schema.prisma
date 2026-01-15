@@ -110,6 +110,7 @@ model RiskEvent {
   shop        String
   orderGid    String
   orderNumber String?
+  rulesVersion String @default("unknown")
 
   // webhook meta
   source    RiskEventSource

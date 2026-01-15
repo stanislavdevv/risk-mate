@@ -7,6 +7,7 @@ import { computeRiskFromWebhookPayload } from "../riskmate/riskEngine.server";
 import { upsertRiskIfChanged } from "../riskmate/riskStore.server";
 import { createOrderRiskAssessment } from "../riskmate/orderRiskAssessment.server";
 import { setOrderRiskTags } from "../riskmate/shopifyActions.server";
+import { getCurrentRulesVersion } from "../riskmate/rulesetVersion.server";
 
 import crypto from "crypto";
 import prisma from "../db.server";
@@ -153,6 +154,7 @@ export async function action({ request }: ActionFunctionArgs) {
       // still append RiskEvent (central log)
       const source = topicToSource(t);
       if (source) {
+        const rulesVersion = await getCurrentRulesVersion(shop);
 
         await prisma.riskEvent.create({
           data: {
@@ -162,6 +164,7 @@ export async function action({ request }: ActionFunctionArgs) {
             source,
             topic: t,
             webhookId: webhookIdFromHeaders(request),
+            rulesVersion,
 
             snapshot: stable, // safe snapshot
             evaluated: [], // not computed
@@ -220,6 +223,7 @@ export async function action({ request }: ActionFunctionArgs) {
           source,
           topic: t,
           webhookId: webhookIdFromHeaders(request),
+          rulesVersion: computed.rulesVersion,
 
           snapshot: stable, // safe snapshot (можно заменить на более широкий safe snapshot позже)
           evaluated: computed?.evaluatedRules ?? [], // если у тебя движок начнёт отдавать — подхватим

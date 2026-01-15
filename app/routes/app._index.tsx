@@ -5,6 +5,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import prisma from "../db.server";
 import { authenticate } from "../shopify.server";
 import { SUPPORTED_LANGS, type Lang, t, parseLang } from "../i18n/strings";
+import { computeRulesVersion } from "../riskmate/rulesetVersion.server";
 
 /* ---------- types ---------- */
 
@@ -43,6 +44,7 @@ type Row = {
   createdAt: string;
   updatedAt: string;
   orderAdminUrl: string | null;
+  rulesVersion: string | null;
 
   // trust
   lastTopic: string | null;
@@ -84,6 +86,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
     where: { shop: session.shop },
     orderBy: { createdAt: "desc" },
   });
+  const currentRulesVersion = computeRulesVersion(rules);
 
   const where: any = { shop: session.shop };
   if (level === "LOW" || level === "MEDIUM" || level === "HIGH") where.riskLevel = level;
@@ -97,7 +100,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
   const orderGids = items.map((it) => it.orderGid);
   const latestEventsByOrder = new Map<
     string,
-    { decision: string | null; skipReason: string | null; reasonsJson: string | null }
+    { decision: string | null; skipReason: string | null; reasonsJson: string | null; rulesVersion: string | null }
   >();
 
   if (orderGids.length > 0) {
@@ -114,6 +117,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
           decision: event.decision ?? null,
           skipReason: skipReason ?? normalizeSkipReason((event as any).skipReason) ?? null,
           reasonsJson: reasonsFromEvent ? JSON.stringify(reasonsFromEvent) : (event as any).reasonsJson ?? null,
+          rulesVersion: (event as any).rulesVersion ?? null,
         });
       }
     }
@@ -143,6 +147,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
     lang,
     hasRules,
     hasChecks,
+    currentRulesVersion,
     rules: rules.map(
       (r): Rule => ({
         id: r.id,
@@ -205,6 +210,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
           createdAt: it.createdAt.toISOString(),
           updatedAt: it.updatedAt.toISOString(),
           orderAdminUrl,
+          rulesVersion: latestEvent?.rulesVersion ?? null,
 
           // trust (field-safe during migration)
           lastTopic: (it as any).lastTopic ?? null,
@@ -535,6 +541,16 @@ export default function AppIndex() {
                               lang={lang}
                             />
                           </div>
+                          <div style={{ marginTop: 2, fontSize: 12, color: "#6d7175" }}>
+                            {t(lang, "rulesVersionLabel")}:{" "}
+                            {r.rulesVersion ? (
+                              <code style={codeInline} title={r.rulesVersion}>
+                                {shortRulesVersion(r.rulesVersion)}
+                              </code>
+                            ) : (
+                              <span style={subtle}>—</span>
+                            )}
+                          </div>
                         </td>
 
                         <td style={td}>{formatDate(r.updatedAt)}</td>
@@ -740,6 +756,12 @@ function RulesInline({ data, lang }: { data: LoaderData; lang: Lang }) {
           <h2 style={h2}>{t(lang, "rulesTitle")}</h2>
           <div style={subtle}>
             {t(lang, "rulesSubtitle")} <b>{data.currency}</b>
+          </div>
+          <div style={{ ...subtle, marginTop: 6 }}>
+            {t(lang, "rulesVersionLabel")}:{" "}
+            <code style={codeInline} title={data.currentRulesVersion}>
+              {shortRulesVersion(data.currentRulesVersion)}
+            </code>
           </div>
         </div>
 
@@ -1145,7 +1167,7 @@ function normalizeSkipReason(raw: unknown) {
   if (lower.includes("out of order")) return "OUT_OF_ORDER";
   if (lower.includes("no rules")) return "NO_RULES";
   if (/^skipped\b/i.test(s)) return s;
-  return s;
+  return null;
 }
 
 function extractReasonsArray(reasons: any) {
@@ -1212,6 +1234,10 @@ function formatDate(iso: string | null | undefined) {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return "—";
   return d.toLocaleString();
+}
+
+function shortRulesVersion(version: string) {
+  return version.length > 8 ? version.slice(0, 8) : version;
 }
 
 function EmptyState({ title, children }: { title: string; children: React.ReactNode }) {
