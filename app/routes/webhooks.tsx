@@ -8,11 +8,14 @@ import { upsertRiskIfChanged } from "../riskmate/riskStore.server";
 import { createOrderRiskAssessment } from "../riskmate/orderRiskAssessment.server";
 import { setOrderRiskTags } from "../riskmate/shopifyActions.server";
 import { getCurrentRulesetSnapshot, getCurrentRulesVersion } from "../riskmate/rulesetVersion.server";
+import { decisionFromRiskLevel } from "../riskmate/decision";
 
 import crypto from "crypto";
 import prisma from "../db.server";
 
 // ---------------- helpers ----------------
+
+const ALLOWED_TOPICS = new Set(["orders/create", "orders/updated", "orders/paid"]);
 
 function normalizeTopic(topic: unknown) {
   const t = String(topic ?? "").toLowerCase().trim();
@@ -64,6 +67,41 @@ function normalizeRiskLevel(level: any): "LOW" | "MEDIUM" | "HIGH" {
   if (v === "HIGH") return "HIGH";
   if (v === "MEDIUM") return "MEDIUM";
   return "LOW";
+}
+
+async function createRiskEvent(input: {
+  shop: string;
+  orderGid: string;
+  orderName?: string | null;
+  source: "ORDERS_CREATE" | "ORDERS_UPDATED";
+  topic: string;
+  webhookId: string | null;
+  rulesVersion: string;
+  rulesSnapshot: any[] | null;
+  snapshot: any;
+  reasons: { summary: string; factors: any[] };
+  riskScore: number;
+  riskLevel: "LOW" | "MEDIUM" | "HIGH";
+  decision: "ALLOW" | "REVIEW" | "HOLD";
+}) {
+  await prisma.riskEvent.create({
+    data: {
+      shop: input.shop,
+      orderGid: input.orderGid,
+      orderNumber: input.orderName ?? null,
+      source: input.source,
+      topic: input.topic,
+      webhookId: input.webhookId,
+      rulesVersion: input.rulesVersion,
+      rulesSnapshot: input.rulesSnapshot ?? undefined,
+      snapshot: input.snapshot,
+      evaluated: [],
+      reasons: input.reasons,
+      riskScore: input.riskScore,
+      riskLevel: input.riskLevel,
+      decision: input.decision,
+    },
+  });
 }
 
 function buildReasonsV2FromString(reasonsJson: string | null | undefined) {
@@ -160,8 +198,7 @@ export async function action({ request }: ActionFunctionArgs) {
     }
 
     // only create/update for now (paid can stay in allow-list but we won't map it to source)
-    const allowed = new Set(["orders/create", "orders/updated", "orders/paid"]);
-    if (!allowed.has(t)) return new Response("OK");
+    if (!ALLOWED_TOPICS.has(t)) return new Response("OK");
 
     const orderGid = (payload as any)?.admin_graphql_api_id as string | undefined;
     const orderName = (payload as any)?.name as string | undefined;
@@ -208,25 +245,20 @@ export async function action({ request }: ActionFunctionArgs) {
         const rulesVersion = await getCurrentRulesVersion(shop);
         const rulesSnapshot = await getCurrentRulesetSnapshot(shop);
 
-        await prisma.riskEvent.create({
-          data: {
-            shop,
-            orderGid,
-            orderNumber: orderName ?? null,
-            source,
-            topic: t,
-            webhookId: webhookIdFromHeaders(request),
-            rulesVersion,
-            rulesSnapshot,
-
-            snapshot: stable, // safe snapshot
-            evaluated: [], // not computed
-            reasons: { summary: "Skipped: out of order", factors: [] },
-
-            riskScore: 0,
-            riskLevel: "LOW",
-            decision: "ALLOW",
-          },
+        await createRiskEvent({
+          shop,
+          orderGid,
+          orderName,
+          source,
+          topic: t,
+          webhookId: webhookIdFromHeaders(request),
+          rulesVersion,
+          rulesSnapshot,
+          snapshot: stable,
+          reasons: { summary: "Skipped: out of order", factors: [] },
+          riskScore: 0,
+          riskLevel: "LOW",
+          decision: "ALLOW",
         });
       }
 
@@ -262,31 +294,22 @@ export async function action({ request }: ActionFunctionArgs) {
       const eventReasons = store.skipped
         ? { summary: "Skipped: unchanged", factors: [] }
         : reasonsV2;
-      const decision =
-        riskLevel === "HIGH" ? "HOLD" :
-          riskLevel === "MEDIUM" ? "REVIEW" :
-            "ALLOW";
+      const decision = decisionFromRiskLevel(riskLevel) ?? "ALLOW";
 
-      await prisma.riskEvent.create({
-        data: {
-          shop,
-          orderGid,
-          orderNumber: orderName ?? null,
-
-          source,
-          topic: t,
-          webhookId: webhookIdFromHeaders(request),
-          rulesVersion: computed.rulesVersion,
-          rulesSnapshot: computed.rulesSnapshot,
-
-          snapshot: stable, // safe snapshot (можно заменить на более широкий safe snapshot позже)
-          evaluated: [], // reserved for future evaluated rules payload
-          reasons: eventReasons,
-
-          riskScore: store.skipped ? 0 : riskScore,
-          riskLevel: store.skipped ? "LOW" : (riskLevel as any),
-          decision,
-        },
+      await createRiskEvent({
+        shop,
+        orderGid,
+        orderName,
+        source,
+        topic: t,
+        webhookId: webhookIdFromHeaders(request),
+        rulesVersion: computed.rulesVersion,
+        rulesSnapshot: computed.rulesSnapshot,
+        snapshot: stable,
+        reasons: eventReasons,
+        riskScore: store.skipped ? 0 : riskScore,
+        riskLevel: store.skipped ? "LOW" : (riskLevel as any),
+        decision,
       });
     }
 

@@ -8,6 +8,29 @@ import { SUPPORTED_LANGS, type Lang, t, parseLang } from "../i18n/strings";
 import { computeRulesVersion } from "../riskmate/rulesetVersion.server";
 import { computeRiskFromSnapshot } from "../riskmate/riskEngine.server";
 
+type LoaderData = Awaited<ReturnType<typeof loader>>;
+
+type ActionData =
+  | { ok: true; op: "addRule"; rule: Rule }
+  | { ok: true; op: "seedDefaults"; rules: Rule[] }
+  | { ok: true; op: "updateRule"; id: string }
+  | { ok: true; op: "toggleRule"; id: string; enabled: boolean }
+  | { ok: true; op: "deleteRule"; id: string }
+  | { ok: true; op: "loadRuleHistory"; items: RuleChange[]; hasMore: boolean }
+  | {
+      ok: true;
+      op: "simulate";
+      orderGid: string;
+      current: { decision: string; score: number; factors: SimFactor[] };
+      simulated: { decision: string; score: number; factors: SimFactor[] };
+      diff: {
+        scoreDiff: number;
+        added: SimFactor[];
+        removed: SimFactor[];
+      };
+    }
+  | { ok: false; error: string };
+
 /* ---------- types ---------- */
 
 type RuleType = "ORDER_VALUE" | "FIRST_TIME" | "HIGH_QTY" | "COUNTRY_MISMATCH";
@@ -74,8 +97,6 @@ type Row = {
   orderAdminUrl: string | null;
   rulesVersion: string | null;
   rulesSnapshot: any[] | null;
-
-  // trust
   lastTopic: string | null;
   lastEventAt: string | null;
   eventCount: number;
@@ -83,29 +104,6 @@ type Row = {
   lastDecision: string | null;
   skipReason: string | null;
 };
-
-type LoaderData = Awaited<ReturnType<typeof loader>>;
-
-type ActionData =
-  | { ok: true; op: "addRule"; rule: Rule }
-  | { ok: true; op: "seedDefaults"; rules: Rule[] }
-  | { ok: true; op: "updateRule"; id: string }
-  | { ok: true; op: "toggleRule"; id: string; enabled: boolean }
-  | { ok: true; op: "deleteRule"; id: string }
-  | { ok: true; op: "loadRuleHistory"; items: RuleChange[]; hasMore: boolean }
-  | {
-      ok: true;
-      op: "simulate";
-      orderGid: string;
-      current: { decision: string; score: number; factors: SimFactor[] };
-      simulated: { decision: string; score: number; factors: SimFactor[] };
-      diff: {
-        scoreDiff: number;
-        added: SimFactor[];
-        removed: SimFactor[];
-      };
-    }
-  | { ok: false; error: string };
 
 type SimFactor = {
   ruleKey: string;
@@ -1100,7 +1098,7 @@ export default function AppIndex() {
         <RulesInline data={data} lang={lang} focusedRuleId={focusedRuleId} />
       ) : (
         <EventsTab
-          data={data}
+          events={data.events}
           lang={lang}
           openRulesetId={openRulesetId}
           setOpenRulesetId={setOpenRulesetId}
@@ -1193,7 +1191,7 @@ function QueueTab({
                   </div>
                 </td>
                 <td style={td}>
-                  <div style={{ fontWeight: 600 }}>{row.summary}</div>
+                  <div style={{ fontWeight: 600 }}>{formatReasonsSummary(row.summary, lang)}</div>
                   {row.factors.length ? (
                     <div style={{ marginTop: 4, position: "relative" }}>
                       <span
@@ -1235,6 +1233,208 @@ function QueueTab({
         </table>
       </div>
     </section>
+  );
+}
+
+/* ---------- Events tab (✅ теперь тут Recent events блок) ---------- */
+
+function EventsTab({
+  events,
+  lang,
+  openRulesetId,
+  setOpenRulesetId,
+}: {
+  events: RiskEventRow[];
+  lang: Lang;
+  openRulesetId: string | null;
+  setOpenRulesetId: (next: string | null) => void;
+}) {
+  return (
+    <section style={card}>
+      <div style={cardHeaderRow}>
+        <div>
+          <h2 style={h2}>{t(lang, "recentEventsTitle")}</h2>
+          <div style={subtle}>{t(lang, "recentEventsSubtitle")}</div>
+        </div>
+      </div>
+
+      <div style={divider} />
+
+      {!events || events.length === 0 ? (
+        <EmptyState title={t(lang, "noChecksYetTitle")}>{t(lang, "noEventsYet")}</EmptyState>
+      ) : (
+        <div style={{ overflowX: "auto" }}>
+          <table style={tableOrders}>
+            <thead>
+              <tr>
+                <th style={th}>{t(lang, "evTime")}</th>
+                <th style={th}>{t(lang, "evTopic")}</th>
+                <th style={th}>{t(lang, "evOrder")}</th>
+                <th style={th}>{t(lang, "evDecision")}</th>
+                <th style={th}>{t(lang, "rulesVersionLabel")}</th>
+                <th style={th}>{t(lang, "thLink")}</th>
+              </tr>
+            </thead>
+
+            <tbody>
+              {events.map((e) => (
+                <tr key={e.id}>
+                  <td style={td}>{formatDate(e.eventAt)}</td>
+
+                  <td style={td}>
+                    <code style={codeInline}>{e.topic}</code>
+                  </td>
+
+                  <td style={tdStrong}>
+                    {e.orderName || "—"}
+                    <div style={{ marginTop: 4, fontSize: 12, color: "#6d7175" }}>
+                      <code style={codeInline}>{shortGid(e.orderGid)}</code>
+                    </div>
+                  </td>
+
+                  <td style={td}>
+                    <DecisionDisplay decision={e.decision} skipReason={e.skipReason} lang={lang} />
+                  </td>
+
+                  <td style={td}>
+                    {e.rulesVersion ? (
+                      Array.isArray(e.rulesSnapshot) ? (
+                        <span style={{ position: "relative", display: "inline-flex" }}>
+                          <span
+                            style={popoverTrigger}
+                            tabIndex={0}
+                            onClick={() =>
+                              setOpenRulesetId(openRulesetId === e.id ? null : e.id)
+                            }
+                            onBlur={() => {
+                              window.setTimeout(() => setOpenRulesetId(null), 0);
+                            }}
+                          >
+                            <code style={codeInline} title={e.rulesVersion}>
+                              v{shortRulesVersion(e.rulesVersion)}
+                            </code>
+                          </span>
+                          {openRulesetId === e.id ? (
+                            <div style={popoverCard}>
+                              {rulesetPopoverLines(e.rulesSnapshot, lang).map((line) => (
+                                <div key={line} style={popoverLine}>
+                                  {line}
+                                </div>
+                              ))}
+                            </div>
+                          ) : null}
+                        </span>
+                      ) : (
+                        <code style={codeInline} title={e.rulesVersion}>
+                          v{shortRulesVersion(e.rulesVersion)}
+                        </code>
+                      )
+                    ) : (
+                      <span style={subtle}>—</span>
+                    )}
+                  </td>
+
+                  <td style={td}>
+                    {e.orderAdminUrl ? (
+                      <a href={e.orderAdminUrl} target="_blank" rel="noreferrer" style={link}>
+                        {t(lang, "open")}
+                      </a>
+                    ) : (
+                      <span style={subtle}>—</span>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
+  );
+}
+
+/* ---------- Setup checklist ---------- */
+
+function SetupChecklist({
+  lang,
+  hasRules,
+  hasChecks,
+  shop,
+}: {
+  lang: Lang;
+  hasRules: boolean;
+  hasChecks: boolean;
+  shop: string;
+}) {
+  const done = hasRules && hasChecks;
+  if (done) return null;
+
+  const storeHandle = shop.replace(".myshopify.com", "");
+
+  return (
+    <section style={checkCard}>
+      <div style={checkHeader}>
+        <div>
+          <div style={{ fontWeight: 800 }}>{t(lang, "setupChecklistTitle")}</div>
+          <div style={{ color: "#6d7175", fontSize: 13 }}>{t(lang, "setupChecklistSubtitle")}</div>
+        </div>
+        <span style={pillMini("warn")}>{t(lang, "setup")}</span>
+      </div>
+
+      <div style={{ height: 10 }} />
+
+      <div style={checkList}>
+        <CheckItem
+          done={hasRules}
+          title={t(lang, "createRulesTitle")}
+          desc={hasRules ? t(lang, "createRulesDone") : t(lang, "createRulesTodo")}
+        />
+
+        <CheckItem
+          done={hasChecks}
+          title={t(lang, "receiveWebhooksTitle")}
+          desc={hasChecks ? t(lang, "receiveWebhooksDone") : t(lang, "receiveWebhooksTodo")}
+          extra={
+            !hasChecks ? (
+              <div style={{ marginTop: 6, fontSize: 13, color: "#202223" }}>
+                {t(lang, "quickLink")}:{" "}
+                <a
+                  href={`https://admin.shopify.com/store/${storeHandle}/orders`}
+                  target="_blank"
+                  rel="noreferrer"
+                  style={link}
+                >
+                  {t(lang, "openOrdersInAdmin")}
+                </a>
+              </div>
+            ) : null
+          }
+        />
+      </div>
+    </section>
+  );
+}
+
+function CheckItem({
+  done,
+  title,
+  desc,
+  extra,
+}: {
+  done: boolean;
+  title: string;
+  desc: string;
+  extra?: React.ReactNode;
+}) {
+  return (
+    <div style={checkItem}>
+      <div style={checkIcon(done)}>{done ? "✓" : "•"}</div>
+      <div style={{ minWidth: 0 }}>
+        <div style={{ fontWeight: 800, fontSize: 13 }}>{title}</div>
+        <div style={{ color: "#6d7175", fontSize: 13 }}>{desc}</div>
+        {extra}
+      </div>
+    </div>
   );
 }
 
@@ -1723,207 +1923,7 @@ function RulesInline({
   );
 }
 
-/* ---------- Events tab (✅ теперь тут Recent events блок) ---------- */
-
-function EventsTab({
-  data,
-  lang,
-  openRulesetId,
-  setOpenRulesetId,
-}: {
-  data: LoaderData;
-  lang: Lang;
-  openRulesetId: string | null;
-  setOpenRulesetId: (next: string | null) => void;
-}) {
-  return (
-    <section style={card}>
-      <div style={cardHeaderRow}>
-        <div>
-          <h2 style={h2}>{t(lang, "recentEventsTitle")}</h2>
-          <div style={subtle}>{t(lang, "recentEventsSubtitle")}</div>
-        </div>
-      </div>
-
-      <div style={divider} />
-
-      {!data.events || data.events.length === 0 ? (
-        <EmptyState title={t(lang, "noChecksYetTitle")}>{t(lang, "noEventsYet")}</EmptyState>
-      ) : (
-        <div style={{ overflowX: "auto" }}>
-          <table style={tableOrders}>
-            <thead>
-              <tr>
-                <th style={th}>{t(lang, "evTime")}</th>
-                <th style={th}>{t(lang, "evTopic")}</th>
-                <th style={th}>{t(lang, "evOrder")}</th>
-                <th style={th}>{t(lang, "evDecision")}</th>
-                <th style={th}>{t(lang, "rulesVersionLabel")}</th>
-                <th style={th}>{t(lang, "thLink")}</th>
-              </tr>
-            </thead>
-
-            <tbody>
-              {data.events.map((e) => (
-                <tr key={e.id}>
-                  <td style={td}>{formatDate(e.eventAt)}</td>
-
-                  <td style={td}>
-                    <code style={codeInline}>{e.topic}</code>
-                  </td>
-
-                  <td style={tdStrong}>
-                    {e.orderName || "—"}
-                    <div style={{ marginTop: 4, fontSize: 12, color: "#6d7175" }}>
-                      <code style={codeInline}>{shortGid(e.orderGid)}</code>
-                    </div>
-                  </td>
-
-                  <td style={td}>
-                    <DecisionDisplay decision={e.decision} skipReason={e.skipReason} lang={lang} />
-                  </td>
-
-                  <td style={td}>
-                    {e.rulesVersion ? (
-                      Array.isArray(e.rulesSnapshot) ? (
-                        <span style={{ position: "relative", display: "inline-flex" }}>
-                          <span
-                            style={popoverTrigger}
-                            tabIndex={0}
-                            onClick={() =>
-                              setOpenRulesetId(openRulesetId === e.id ? null : e.id)
-                            }
-                            onBlur={() => {
-                              window.setTimeout(() => setOpenRulesetId(null), 0);
-                            }}
-                          >
-                            <code style={codeInline} title={e.rulesVersion}>
-                              v{shortRulesVersion(e.rulesVersion)}
-                            </code>
-                          </span>
-                          {openRulesetId === e.id ? (
-                            <div style={popoverCard}>
-                              {rulesetPopoverLines(e.rulesSnapshot, lang).map((line) => (
-                                <div key={line} style={popoverLine}>
-                                  {line}
-                                </div>
-                              ))}
-                            </div>
-                          ) : null}
-                        </span>
-                      ) : (
-                        <code style={codeInline} title={e.rulesVersion}>
-                          v{shortRulesVersion(e.rulesVersion)}
-                        </code>
-                      )
-                    ) : (
-                      <span style={subtle}>—</span>
-                    )}
-                  </td>
-
-                  <td style={td}>
-                    {e.orderAdminUrl ? (
-                      <a href={e.orderAdminUrl} target="_blank" rel="noreferrer" style={link}>
-                        {t(lang, "open")}
-                      </a>
-                    ) : (
-                      <span style={subtle}>—</span>
-                    )}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
-    </section>
-  );
-}
-
-/* ---------- Setup checklist ---------- */
-
-function SetupChecklist({
-  lang,
-  hasRules,
-  hasChecks,
-  shop,
-}: {
-  lang: Lang;
-  hasRules: boolean;
-  hasChecks: boolean;
-  shop: string;
-}) {
-  const done = hasRules && hasChecks;
-  if (done) return null;
-
-  const storeHandle = shop.replace(".myshopify.com", "");
-
-  return (
-    <section style={checkCard}>
-      <div style={checkHeader}>
-        <div>
-          <div style={{ fontWeight: 800 }}>{t(lang, "setupChecklistTitle")}</div>
-          <div style={{ color: "#6d7175", fontSize: 13 }}>{t(lang, "setupChecklistSubtitle")}</div>
-        </div>
-        <span style={pillMini("warn")}>{t(lang, "setup")}</span>
-      </div>
-
-      <div style={{ height: 10 }} />
-
-      <div style={checkList}>
-        <CheckItem
-          done={hasRules}
-          title={t(lang, "createRulesTitle")}
-          desc={hasRules ? t(lang, "createRulesDone") : t(lang, "createRulesTodo")}
-        />
-
-        <CheckItem
-          done={hasChecks}
-          title={t(lang, "receiveWebhooksTitle")}
-          desc={hasChecks ? t(lang, "receiveWebhooksDone") : t(lang, "receiveWebhooksTodo")}
-          extra={
-            !hasChecks ? (
-              <div style={{ marginTop: 6, fontSize: 13, color: "#202223" }}>
-                {t(lang, "quickLink")}:{" "}
-                <a
-                  href={`https://admin.shopify.com/store/${storeHandle}/orders`}
-                  target="_blank"
-                  rel="noreferrer"
-                  style={link}
-                >
-                  {t(lang, "openOrdersInAdmin")}
-                </a>
-              </div>
-            ) : null
-          }
-        />
-      </div>
-    </section>
-  );
-}
-
-function CheckItem({
-  done,
-  title,
-  desc,
-  extra,
-}: {
-  done: boolean;
-  title: string;
-  desc: string;
-  extra?: React.ReactNode;
-}) {
-  return (
-    <div style={checkItem}>
-      <div style={checkIcon(done)}>{done ? "✓" : "•"}</div>
-      <div style={{ minWidth: 0 }}>
-        <div style={{ fontWeight: 800, fontSize: 13 }}>{title}</div>
-        <div style={{ color: "#6d7175", fontSize: 13 }}>{desc}</div>
-        {extra}
-      </div>
-    </div>
-  );
-}
+/* ---------- Helpers and styles below ---------- */
 
 /* ---------- helpers ---------- */
 
@@ -2025,6 +2025,17 @@ function formatReasonLabel(reason: any, lang: Lang) {
     return ruleTypeLabel(lang, reason.code as RuleType);
   }
   return t(lang, "reasonFallback");
+}
+
+function formatReasonsSummary(summary: string, lang: Lang) {
+  const map: Record<string, string> = {
+    "Rule matches": "summaryRuleMatches",
+    "No rules matched": "summaryNoRulesMatched",
+    "Risk reasons": "summaryRiskReasons",
+    "No reasons provided": "summaryNoReasonsProvided",
+  };
+  const key = map[summary];
+  return key ? t(lang, key) : summary;
 }
 
 function reasonRuleKey(reason: any) {

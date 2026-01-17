@@ -9,6 +9,9 @@ const SCORE_MIN = 0;
 const SCORE_MAX = 100;
 const MAX_REASONS = 20; // в БД и UI
 const MAX_FACTS = 10;
+const SUMMARY_RULE_MATCHES = "Rule matches";
+const SUMMARY_NO_RULES = "No rules matched";
+const FACT_NO_RULES = "[RiskMate] No rules matched.";
 
 function clampScore(n: number) {
   if (!Number.isFinite(n)) return 0;
@@ -96,6 +99,65 @@ function deriveMvpPolicyTags(level: RiskLevel) {
   return { review: false, hold: false };
 }
 
+function buildTags(riskLevel: RiskLevel, actions: string[]) {
+  const policy = deriveMvpPolicyTags(riskLevel);
+
+  const tags = new Set<string>();
+  tags.add("risk-mate");
+  tags.add(`risk:${riskLevel.toLowerCase()}`);
+
+  const wantReview = actions.some((a) => normalizeAction(a) === "REVIEW");
+  const wantHold = actions.some((a) => normalizeAction(a) === "HOLD");
+
+  if (policy.review && wantReview) tags.add("risk_review");
+  if (policy.hold && wantHold) tags.add("risk_hold");
+
+  return tags;
+}
+
+function buildFacts(reasons: RuleFactor[]) {
+  return reasons.length > 0
+    ? Array.from(new Set(reasons.map((r) => r.label)))
+        .slice(0, MAX_FACTS)
+        .map((label) => ({
+          description: `[RiskMate] ${label}`,
+          sentiment: "NEGATIVE" as const,
+        }))
+    : [{ description: FACT_NO_RULES, sentiment: "NEUTRAL" as const }];
+}
+
+function buildReasonsPayload(reasons: RuleFactor[]) {
+  return {
+    summary: reasons.length > 0 ? SUMMARY_RULE_MATCHES : SUMMARY_NO_RULES,
+    factors: reasons,
+  };
+}
+
+function computeFromRules(rules: Awaited<ReturnType<typeof prisma.riskRule.findMany>>, ctx: any) {
+  const enabledRules = rules.filter((rule) => rule.enabled);
+  const base = evaluateRules(enabledRules, ctx) as any;
+  const rawScore = Number(base?.score ?? 0);
+  const score = clampScore(rawScore);
+  const reasons = sanitizeFactors(Array.isArray(base?.factors) ? base.factors : []);
+  const actions: string[] = Array.isArray(base?.actions) ? base.actions.map(String) : [];
+  const riskLevel = calculateRiskLevel(score);
+  const decision = decisionFromRiskLevel(riskLevel);
+  const tags = buildTags(riskLevel, actions);
+  const facts = buildFacts(reasons);
+  const reasonsPayload = buildReasonsPayload(reasons);
+
+  return {
+    score,
+    riskLevel,
+    decision,
+    reasons,
+    reasonsJson: safeJson(reasonsPayload),
+    actions,
+    tags: Array.from(tags),
+    facts,
+  };
+}
+
 export async function computeRiskFromWebhookPayload(
   shop: string,
   payload: unknown,
@@ -118,7 +180,6 @@ export async function computeRiskFromWebhookPayload(
   });
   const rulesVersion = computeRulesVersion(rules);
   const rulesSnapshot = buildRulesetSnapshot(rules);
-  const enabledRules = rules.filter((rule) => rule.enabled);
 
   const orderTotal = Number((payload as any)?.current_total_price ?? 0);
 
@@ -133,71 +194,17 @@ export async function computeRiskFromWebhookPayload(
   const shippingCountry = (payload as any)?.shipping_address?.country_code as string | undefined;
   const billingCountry = (payload as any)?.billing_address?.country_code as string | undefined;
 
-  const base = evaluateRules(enabledRules, {
+  const base = computeFromRules(rules, {
     orderTotal,
     quantity,
     isFirstOrder,
     shippingCountry,
     billingCountry,
     topic, // если вдруг позже захочешь учитывать topic в rules engine
-  } as any) as any;
-
-  // 1) Clamp score
-  const rawScore = Number(base?.score ?? 0);
-  const score = clampScore(rawScore);
-
-  // 2) Sanitize reasons & actions
-  const reasons = sanitizeFactors(Array.isArray(base?.factors) ? base.factors : []);
-  const actions: string[] = Array.isArray(base?.actions) ? base.actions.map(String) : [];
-
-  // 3) Risk level is derived ONLY from score (policy source of truth)
-  const riskLevel = calculateRiskLevel(score);
-  const decision = decisionFromRiskLevel(riskLevel);
-
-  // 4) MVP policy tags (minimal)
-  // We do NOT honor arbitrary TAG:* actions in MVP.
-  // We gate HOLD/REVIEW by level.
-  const policy = deriveMvpPolicyTags(riskLevel);
-
-  const tags = new Set<string>();
-  tags.add("risk-mate");
-  tags.add(`risk:${riskLevel.toLowerCase()}`);
-
-  // If you still want to show rule actions somewhere in UI, keep them in `actions`,
-  // but don't translate them to tags here.
-  //
-  // Optionally: if you want to allow REVIEW/HOLD only when level allows it:
-  const wantReview = actions.some((a) => normalizeAction(a) === "REVIEW");
-  const wantHold = actions.some((a) => normalizeAction(a) === "HOLD");
-
-  if (policy.review && wantReview) tags.add("risk_review");
-  if (policy.hold && wantHold) tags.add("risk_hold");
-
-  // 5) Facts for assessment (short + safe)
-  const facts =
-    reasons.length > 0
-      ? Array.from(new Set(reasons.map((r) => r.label)))
-          .slice(0, MAX_FACTS)
-          .map((label) => ({
-            description: `[RiskMate] ${label}`,
-            sentiment: "NEGATIVE" as const,
-          }))
-      : [{ description: "[RiskMate] No rules matched.", sentiment: "NEUTRAL" as const }];
-
-  const reasonsPayload = {
-    summary: reasons.length > 0 ? "Rule matches" : "No rules matched",
-    factors: reasons,
-  };
+  } as any);
 
   return {
-    score,
-    riskLevel,
-    decision,
-    reasons,
-    reasonsJson: safeJson(reasonsPayload),
-    actions,
-    tags: Array.from(tags),
-    facts,
+    ...base,
     rulesVersion,
     rulesSnapshot,
   };
@@ -219,7 +226,6 @@ export async function computeRiskFromSnapshot(
   });
   const rulesVersion = computeRulesVersion(rules);
   const rulesSnapshot = buildRulesetSnapshot(rules);
-  const enabledRules = rules.filter((rule) => rule.enabled);
 
   const orderTotal = Number(snapshot?.total ?? 0);
   const quantity = Number(snapshot?.qty ?? 0);
@@ -228,57 +234,16 @@ export async function computeRiskFromSnapshot(
   const shippingCountry = snapshot?.shippingCountry ?? undefined;
   const billingCountry = snapshot?.billingCountry ?? undefined;
 
-  const base = evaluateRules(enabledRules, {
+  const base = computeFromRules(rules, {
     orderTotal,
     quantity,
     isFirstOrder,
     shippingCountry,
     billingCountry,
-  } as any) as any;
-
-  const rawScore = Number(base?.score ?? 0);
-  const score = clampScore(rawScore);
-  const reasons = sanitizeFactors(Array.isArray(base?.factors) ? base.factors : []);
-  const actions: string[] = Array.isArray(base?.actions) ? base.actions.map(String) : [];
-
-  const riskLevel = calculateRiskLevel(score);
-  const decision = decisionFromRiskLevel(riskLevel);
-  const policy = deriveMvpPolicyTags(riskLevel);
-
-  const tags = new Set<string>();
-  tags.add("risk-mate");
-  tags.add(`risk:${riskLevel.toLowerCase()}`);
-
-  const wantReview = actions.some((a) => normalizeAction(a) === "REVIEW");
-  const wantHold = actions.some((a) => normalizeAction(a) === "HOLD");
-
-  if (policy.review && wantReview) tags.add("risk_review");
-  if (policy.hold && wantHold) tags.add("risk_hold");
-
-  const facts =
-    reasons.length > 0
-      ? Array.from(new Set(reasons.map((r) => r.label)))
-          .slice(0, MAX_FACTS)
-          .map((label) => ({
-            description: `[RiskMate] ${label}`,
-            sentiment: "NEGATIVE" as const,
-          }))
-      : [{ description: "[RiskMate] No rules matched.", sentiment: "NEUTRAL" as const }];
-
-  const reasonsPayload = {
-    summary: reasons.length > 0 ? "Rule matches" : "No rules matched",
-    factors: reasons,
-  };
+  } as any);
 
   return {
-    score,
-    riskLevel,
-    decision,
-    reasons,
-    reasonsJson: safeJson(reasonsPayload),
-    actions,
-    tags: Array.from(tags),
-    facts,
+    ...base,
     rulesVersion,
     rulesSnapshot,
   };
