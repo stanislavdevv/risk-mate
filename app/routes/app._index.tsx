@@ -35,6 +35,20 @@ type RuleChange = {
   changes: Array<{ field: string; from: string | null; to: string | null }>;
 };
 
+type QueueRow = {
+  id: string;
+  orderGid: string;
+  orderName: string;
+  orderAdminUrl: string | null;
+  score: number;
+  riskLevel: "LOW" | "MEDIUM" | "HIGH";
+  decision: "REVIEW" | "HOLD";
+  summary: string;
+  factors: any[];
+  lastEventAt: string | null;
+  updatedAt: string;
+};
+
 type RiskEventRow = {
   id: string;
   orderGid: string;
@@ -120,6 +134,8 @@ export async function loader({ request }: LoaderFunctionArgs) {
     where: { shop: session.shop },
     orderBy: { createdAt: "desc" },
   });
+  const activeRules = rules.filter((rule) => rule.status === "ACTIVE");
+  const enabledActiveRules = activeRules.filter((rule) => rule.enabled);
   const currentRulesVersion = computeRulesVersion(rules.filter((r) => r.status === "ACTIVE"));
 
   const ruleChanges = await prisma.riskRuleChange.findMany({
@@ -198,6 +214,42 @@ export async function loader({ request }: LoaderFunctionArgs) {
   const hasChecks = items.length > 0;
   const toIso = (d: Date | null | undefined) => (d ? d.toISOString() : null);
 
+  const queueItems = await prisma.riskResult.findMany({
+    where: { shop: session.shop, riskLevel: { in: ["HIGH", "MEDIUM"] } },
+    orderBy: [{ lastEventAt: "desc" }, { updatedAt: "desc" }],
+    take: 100,
+  });
+
+  const queueRows: QueueRow[] = queueItems
+    .map((it) => {
+      const orderId = orderIdFromGid(it.orderGid);
+      const orderAdminUrl = orderId ? shopifyAdminOrderUrl(session.shop, orderId) : null;
+      const parsed = parseReasonsPayload(it.reasonsJson);
+      const decision: QueueRow["decision"] = it.riskLevel === "HIGH" ? "HOLD" : "REVIEW";
+      return {
+        id: it.id,
+        orderGid: it.orderGid,
+        orderName: it.orderName,
+        orderAdminUrl,
+        score: it.score,
+        riskLevel: it.riskLevel as QueueRow["riskLevel"],
+        decision,
+        summary: parsed.summary ?? t(lang, "queueSummaryFallback"),
+        factors: parsed.factors,
+        lastEventAt: toIso(it.lastEventAt),
+        updatedAt: it.updatedAt.toISOString(),
+      };
+    })
+    .sort((a, b) => {
+      const prio = (row: QueueRow) => (row.decision === "HOLD" ? 2 : 1);
+      const prioDiff = prio(b) - prio(a);
+      if (prioDiff !== 0) return prioDiff;
+      if (b.score !== a.score) return b.score - a.score;
+      const aTime = new Date(a.lastEventAt ?? a.updatedAt).getTime();
+      const bTime = new Date(b.lastEventAt ?? b.updatedAt).getTime();
+      return bTime - aTime;
+    });
+
   return {
     shop: session.shop,
     currency,
@@ -206,9 +258,12 @@ export async function loader({ request }: LoaderFunctionArgs) {
     lang,
     hasRules,
     hasChecks,
+    hasActiveRules: activeRules.length > 0,
+    hasEnabledActiveRules: enabledActiveRules.length > 0,
     currentRulesVersion,
     ruleChanges: initialRuleChanges,
     hasMoreRuleChanges,
+    queueRows,
     rules: rules.map(
       (r): Rule => ({
         id: r.id,
@@ -721,11 +776,12 @@ export default function AppIndex() {
   const focusedRuleId = params.get("ruleId");
   const [openFactorId, setOpenFactorId] = useState<string | null>(null);
   const [openRulesetId, setOpenRulesetId] = useState<string | null>(null);
+  const [openQueueReasonId, setOpenQueueReasonId] = useState<string | null>(null);
   const simulateFetcher = useFetcher<ActionData>();
   const [simulationByOrder, setSimulationByOrder] = useState<Record<string, any>>({});
   const simLoadingOrderGid = simulateFetcher.formData?.get("orderGid");
 
-  type Tab = "orders" | "rules" | "events";
+  type Tab = "queue" | "orders" | "rules" | "events";
 
   const setTab = (next: Tab) => {
     const p = new URLSearchParams(params);
@@ -775,6 +831,9 @@ export default function AppIndex() {
       </header>
 
       <div style={tabsWrap}>
+        <button type="button" onClick={() => setTab("queue")} style={tabBtn(tab === "queue")}>
+          {t(lang, "tabQueue")}
+        </button>
         <button type="button" onClick={() => setTab("orders")} style={tabBtn(tab === "orders")}>
           {t(lang, "tabOrders")}
         </button>
@@ -786,7 +845,14 @@ export default function AppIndex() {
         </button>
       </div>
 
-      {tab === "orders" ? (
+      {tab === "queue" ? (
+        <QueueTab
+          data={data}
+          lang={lang}
+          openQueueReasonId={openQueueReasonId}
+          setOpenQueueReasonId={setOpenQueueReasonId}
+        />
+      ) : tab === "orders" ? (
         <>
           <SetupChecklist lang={lang} hasRules={data.hasRules} hasChecks={data.hasChecks} shop={data.shop} />
           <div style={{ height: 12 }} />
@@ -1041,6 +1107,134 @@ export default function AppIndex() {
         />
       )}
     </div>
+  );
+}
+
+/* ---------- Queue tab ---------- */
+
+function QueueTab({
+  data,
+  lang,
+  openQueueReasonId,
+  setOpenQueueReasonId,
+}: {
+  data: LoaderData;
+  lang: Lang;
+  openQueueReasonId: string | null;
+  setOpenQueueReasonId: (next: string | null) => void;
+}) {
+  if (data.queueRows.length === 0) {
+    if (!data.hasActiveRules || !data.hasEnabledActiveRules) {
+      return (
+        <section style={card}>
+          <h2 style={h2}>{t(lang, "queueTitle")}</h2>
+          <div style={divider} />
+          <EmptyState title={t(lang, "queueNoRulesTitle")}>{t(lang, "queueNoRulesBody")}</EmptyState>
+        </section>
+      );
+    }
+
+    return (
+      <section style={card}>
+        <h2 style={h2}>{t(lang, "queueTitle")}</h2>
+        <div style={divider} />
+        <EmptyState title={t(lang, "queueEmptyTitle")}>{t(lang, "queueEmptyBody")}</EmptyState>
+      </section>
+    );
+  }
+
+  return (
+    <section style={card}>
+      <div style={cardHeaderRow}>
+        <div>
+          <h2 style={h2}>{t(lang, "queueTitle")}</h2>
+          <div style={subtle}>{t(lang, "queueSubtitle")}</div>
+        </div>
+      </div>
+
+      <div style={divider} />
+
+      <div style={{ overflowX: "auto" }}>
+        <table style={tableOrders}>
+          <thead>
+            <tr>
+              <th style={th}>{t(lang, "queueLastUpdate")}</th>
+              <th style={th}>{t(lang, "queueOrder")}</th>
+              <th style={th}>{t(lang, "queueDecision")}</th>
+              <th style={th}>{t(lang, "queueRisk")}</th>
+              <th style={th}>{t(lang, "queueWhy")}</th>
+              <th style={th}>{t(lang, "thLink")}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {data.queueRows.map((row) => (
+              <tr key={row.id}>
+                <td style={td}>{formatDate(row.lastEventAt ?? row.updatedAt)}</td>
+                <td style={tdStrong}>
+                  {row.orderName}
+                  <div style={{ marginTop: 4, fontSize: 12, color: "#6d7175" }}>
+                    <code style={codeInline}>{shortGid(row.orderGid)}</code>
+                  </div>
+                </td>
+                <td style={td}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                    <code style={codeInline}>{decisionLabel(lang, row.decision)}</code>
+                    <span style={priorityPill(row.decision)}>
+                      {row.decision === "HOLD" ? t(lang, "priorityHigh") : t(lang, "priorityMedium")}
+                    </span>
+                  </div>
+                </td>
+                <td style={td}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                    <span style={riskPill(row.riskLevel)}>{riskLevelLabel(lang, row.riskLevel)}</span>
+                    <span style={subtle}>
+                      {t(lang, "score")}: {row.score}
+                    </span>
+                  </div>
+                </td>
+                <td style={td}>
+                  <div style={{ fontWeight: 600 }}>{row.summary}</div>
+                  {row.factors.length ? (
+                    <div style={{ marginTop: 4, position: "relative" }}>
+                      <span
+                        style={popoverTrigger}
+                        tabIndex={0}
+                        onClick={() =>
+                          setOpenQueueReasonId(openQueueReasonId === row.id ? null : row.id)
+                        }
+                        onBlur={() => {
+                          window.setTimeout(() => setOpenQueueReasonId(null), 0);
+                        }}
+                      >
+                        <span style={queueDetailsTag}>{t(lang, "queueDetails")}</span>
+                      </span>
+                      {openQueueReasonId === row.id ? (
+                        <div style={popoverCard}>
+                          {row.factors.slice(0, 3).map((factor, idx) => (
+                            <div key={`${row.id}-${idx}`} style={popoverLine}>
+                              {formatReasonLabel(factor, lang)}
+                            </div>
+                          ))}
+                        </div>
+                      ) : null}
+                    </div>
+                  ) : null}
+                </td>
+                <td style={td}>
+                  {row.orderAdminUrl ? (
+                    <a href={row.orderAdminUrl} target="_blank" rel="noreferrer" style={link}>
+                      {t(lang, "open")}
+                    </a>
+                  ) : (
+                    <span style={subtle}>—</span>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </section>
   );
 }
 
@@ -1751,6 +1945,22 @@ function safeJsonParse(s: string) {
   }
 }
 
+function parseReasonsPayload(raw: string | null) {
+  if (!raw) return { summary: null, factors: [] as any[] };
+  try {
+    const v = JSON.parse(raw);
+    if (Array.isArray(v)) return { summary: null, factors: v };
+    if (v && typeof v === "object") {
+      const factors = Array.isArray((v as any).factors) ? (v as any).factors : [];
+      const summary = typeof (v as any).summary === "string" ? (v as any).summary : null;
+      return { summary, factors };
+    }
+    return { summary: null, factors: [] };
+  } catch {
+    return { summary: null, factors: [] };
+  }
+}
+
 function normalizeSkipReason(raw: unknown) {
   const s = typeof raw === "string" ? raw.trim() : "";
   if (!s) return null;
@@ -2175,6 +2385,19 @@ const skipBadge: React.CSSProperties = {
   fontWeight: 700,
 };
 
+const queueDetailsTag: React.CSSProperties = {
+  display: "inline-flex",
+  alignItems: "center",
+  padding: "2px 8px",
+  borderRadius: 999,
+  border: "1px solid #dfe3e8",
+  background: "#ffffff",
+  color: "#4d4f52",
+  fontSize: 11,
+  fontWeight: 700,
+  letterSpacing: "0.02em",
+};
+
 function riskPill(level: "LOW" | "MEDIUM" | "HIGH"): React.CSSProperties {
   const bg = level === "HIGH" ? "#fbeae5" : level === "MEDIUM" ? "#fff5ea" : "#eafbea";
   const bd = level === "HIGH" ? "#f3c0b2" : level === "MEDIUM" ? "#f2d3a5" : "#bfe6bf";
@@ -2189,6 +2412,24 @@ function riskPill(level: "LOW" | "MEDIUM" | "HIGH"): React.CSSProperties {
     color: fg,
     fontSize: 12,
     fontWeight: 700,
+  };
+}
+
+function priorityPill(decision: "HOLD" | "REVIEW"): React.CSSProperties {
+  const isHigh = decision === "HOLD";
+  return {
+    display: "inline-flex",
+    alignItems: "center",
+    padding: "2px 8px",
+    borderRadius: 999,
+    border: isHigh ? "1px solid #f3c0b2" : "1px solid #f2d3a5",
+    background: isHigh ? "#fbeae5" : "#fff5ea",
+    color: isHigh ? "#8a2a0a" : "#7a4a00",
+    fontSize: 11,
+    fontWeight: 800,
+    textTransform: "uppercase",
+    letterSpacing: "0.04em",
+    whiteSpace: "nowrap",
   };
 }
 
