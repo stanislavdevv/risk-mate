@@ -1,5 +1,4 @@
 import "@shopify/shopify-app-react-router/adapters/node";
-import { shopifyApp } from "@shopify/shopify-app-remix/server"; // или твой import
 import { DeliveryMethod } from "@shopify/shopify-api";
 import {
   ApiVersion,

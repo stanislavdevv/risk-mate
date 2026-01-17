@@ -524,6 +524,7 @@ export async function action({ request }: ActionFunctionArgs) {
             points: Math.trunc(d.points),
             action: d.action,
             enabled: d.enabled,
+            status: "ACTIVE",
           },
         }),
       ),
@@ -554,7 +555,7 @@ export async function action({ request }: ActionFunctionArgs) {
     const actionValue = String(form.get("action") ?? "").trim();
     const points = Number(pointsRaw);
 
-    const status = String(form.get("status") ?? "ACTIVE").trim();
+    const status = String(form.get("status") ?? "DRAFT").trim();
     const errors = validate({ type, operator, value, points, status });
     if (errors.length) return json<ActionData>({ ok: false, error: errors.join("; ") }, 400);
 
@@ -606,7 +607,7 @@ export async function action({ request }: ActionFunctionArgs) {
     const value = String(form.get("value") ?? "").trim();
     const pointsRaw = String(form.get("points") ?? "").trim();
     const actionValue = String(form.get("action") ?? "").trim();
-    const status = String(form.get("status") ?? "ACTIVE").trim();
+    const status = String(form.get("status") ?? "DRAFT").trim();
 
     if (!id) return json<ActionData>({ ok: false, error: t(lang, "errorMissingId") }, 400);
 
@@ -1072,7 +1073,7 @@ function RulesInline({
   const allowedStatuses: RuleStatus[] = ["DRAFT", "ACTIVE", "DEPRECATED"];
 
   const [newRuleType, setNewRuleType] = useState<RuleType>("ORDER_VALUE");
-  const [newRuleStatus, setNewRuleStatus] = useState<RuleStatus>("ACTIVE");
+  const [newRuleStatus, setNewRuleStatus] = useState<RuleStatus>("DRAFT");
   const [ruleHistory, setRuleHistory] = useState<RuleChange[]>(data.ruleChanges ?? []);
   const [hasMoreHistory, setHasMoreHistory] = useState<boolean>(Boolean(data.hasMoreRuleChanges));
   const historyFetcher = useFetcher<ActionData>();
@@ -1776,7 +1777,7 @@ function extractFactorsFromReasons(reasons: any): SimFactor[] {
   const factors = Array.isArray(reasons?.factors) ? reasons.factors : [];
   return factors
     .map((f: any) => toSimFactor(f))
-    .filter((f) => f.ruleKey);
+    .filter((f: SimFactor) => f.ruleKey);
 }
 
 function toSimFactor(factor: any): SimFactor {

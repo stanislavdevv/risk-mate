@@ -280,7 +280,7 @@ export async function action({ request }: ActionFunctionArgs) {
           rulesSnapshot: computed.rulesSnapshot,
 
           snapshot: stable, // safe snapshot (можно заменить на более широкий safe snapshot позже)
-          evaluated: computed?.evaluatedRules ?? [], // если у тебя движок начнёт отдавать — подхватим
+          evaluated: [], // reserved for future evaluated rules payload
           reasons: eventReasons,
 
           riskScore: store.skipped ? 0 : riskScore,
