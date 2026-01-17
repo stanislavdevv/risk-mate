@@ -147,13 +147,19 @@ type HealthSnapshot = {
   lastSuccessfulEvalAt: string | null;
   eventsLast24h: number;
   errorsLast24h: number;
+  lastErrorAt: string | null;
+  errorCounts: Array<{ type: string; count: number }>;
   skippedPct24h: number;
+  avgLatencyMs24h: number | null;
+  maxLatencyMs24h: number | null;
   avgRiskScore24h: number | null;
   avgRiskScorePrev24h: number | null;
   holdCount24h: number;
   reviewCount24h: number;
   topicCounts: Array<{ topic: string; count: number }>;
   hasAnyEvents: boolean;
+  staleWebhook: boolean;
+  staleRiskEvent: boolean;
 };
 
 /* ---------- loader ---------- */
@@ -345,11 +351,24 @@ export async function loader({ request }: LoaderFunctionArgs) {
     take: 500,
   });
 
-  const recentErrorsCount = await prisma.riskProcessingError.count({
+  const recentErrors = await prisma.riskProcessingError.findMany({
     where: { shop: session.shop, createdAt: { gte: since24h } },
+    orderBy: { createdAt: "desc" },
+    take: 200,
   });
+  const recentErrorsCount = recentErrors.length;
+  const lastErrorAt = recentErrors[0]?.createdAt ?? null;
+  const errorTypeMap = new Map<string, number>();
+  for (const error of recentErrors) {
+    const type = (error as any).type ?? "PROCESSING";
+    errorTypeMap.set(type, (errorTypeMap.get(type) ?? 0) + 1);
+  }
+  const errorCounts = Array.from(errorTypeMap.entries())
+    .map(([type, count]) => ({ type, count }))
+    .sort((a, b) => b.count - a.count);
 
-  const lastWebhookAt = lastEvent?.createdAt ?? null;
+  const lastWebhookAt = lastEvent?.webhookReceivedAt ?? lastEvent?.createdAt ?? null;
+  const lastRiskEventAt = lastEvent?.createdAt ?? null;
   const lastWebhookTopic = lastEvent?.topic ?? null;
   const lastSuccess = recentEvents.find((ev) => {
     const summary = (ev as any)?.reasons?.summary;
@@ -373,8 +392,24 @@ export async function loader({ request }: LoaderFunctionArgs) {
 
   const avgRiskScore24h = average(recentEvents.map((ev) => ev.riskScore));
   const avgRiskScorePrev24h = average(prevEvents.map((ev) => ev.riskScore));
+  const latencyValues = recentEvents
+    .map((ev) => {
+      if (!ev.webhookReceivedAt) return null;
+      const diff = ev.createdAt.getTime() - ev.webhookReceivedAt.getTime();
+      return Number.isFinite(diff) ? Math.max(0, diff) : null;
+    })
+    .filter((value): value is number => value !== null);
+  const avgLatencyMs24h = average(latencyValues);
+  const maxLatencyMs24h = latencyValues.length > 0 ? Math.max(...latencyValues) : null;
   const holdCount24h = recentEvents.filter((ev) => ev.decision === "HOLD").length;
   const reviewCount24h = recentEvents.filter((ev) => ev.decision === "REVIEW").length;
+
+  const STALE_WEBHOOK_HOURS = 4;
+  const STALE_EVENT_HOURS = 4;
+  const webhookAgeHours = lastWebhookAt ? (now - lastWebhookAt.getTime()) / 3600000 : Infinity;
+  const eventAgeHours = lastRiskEventAt ? (now - lastRiskEventAt.getTime()) / 3600000 : Infinity;
+  const staleWebhook = webhookAgeHours > STALE_WEBHOOK_HOURS;
+  const staleRiskEvent = eventAgeHours > STALE_EVENT_HOURS;
 
   let healthState: HealthState = "HEALTHY";
   const ageMinutes = lastWebhookAt ? (now - lastWebhookAt.getTime()) / 60000 : Infinity;
@@ -391,13 +426,19 @@ export async function loader({ request }: LoaderFunctionArgs) {
     lastSuccessfulEvalAt: lastSuccess ? lastSuccess.toISOString() : null,
     eventsLast24h,
     errorsLast24h: recentErrorsCount,
+    lastErrorAt: lastErrorAt ? lastErrorAt.toISOString() : null,
+    errorCounts,
     skippedPct24h,
+    avgLatencyMs24h,
+    maxLatencyMs24h,
     avgRiskScore24h,
     avgRiskScorePrev24h,
     holdCount24h,
     reviewCount24h,
     topicCounts,
     hasAnyEvents: !!lastEvent,
+    staleWebhook,
+    staleRiskEvent,
   };
 
   return {
@@ -1688,7 +1729,27 @@ function HealthTab({ data, lang }: { data: LoaderData; lang: Lang }) {
               <span style={healthStatLabel}>{t(lang, "healthErrorsToday")}</span>
               <span style={healthStatValue}>{health.errorsLast24h}</span>
             </div>
+            <div style={healthStatRow}>
+              <span style={healthStatLabel}>{t(lang, "healthLastError")}</span>
+              <span style={healthStatValue}>{formatDate(health.lastErrorAt)}</span>
+            </div>
           </div>
+          {health.errorsLast24h > 0 ? (
+            <div style={healthCallout}>
+              <div>{t(lang, "healthSelfHealing")}</div>
+              <div>{t(lang, "healthNoAction")}</div>
+            </div>
+          ) : null}
+          {health.staleWebhook || health.staleRiskEvent ? (
+            <div style={healthWarning}>
+              {health.staleWebhook ? (
+                <div>{t(lang, "healthStaleWebhook", { hours: 4 })}</div>
+              ) : null}
+              {health.staleRiskEvent ? (
+                <div>{t(lang, "healthStaleEvent", { hours: 4 })}</div>
+              ) : null}
+            </div>
+          ) : null}
         </section>
 
         <section style={cardInner}>
@@ -1734,26 +1795,70 @@ function HealthTab({ data, lang }: { data: LoaderData; lang: Lang }) {
               <div>{t(lang, "healthNoEventsBody")}</div>
             </div>
           ) : (
-            <div style={healthStatList}>
-              <div style={healthStatRow}>
-                <span style={healthStatLabel}>{t(lang, "healthSkippedRate")}</span>
-                <span style={healthStatValue}>{formatPercent(health.skippedPct24h)}</span>
-              </div>
+            <>
+              <div style={healthStatList}>
+                <div style={healthStatRow}>
+                  <span style={healthStatLabel}>{t(lang, "healthSkippedRate")}</span>
+                  <span style={healthStatValue}>{formatPercent(health.skippedPct24h)}</span>
+                </div>
               <div style={healthStatRow}>
                 <span style={healthStatLabel}>{t(lang, "healthAvgRiskScore")}</span>
                 <span style={healthStatValue}>{formatScore(health.avgRiskScore24h)}</span>
               </div>
+              <div style={healthStatRow}>
+                <span style={healthStatLabel}>{t(lang, "healthLatencyAvg")}</span>
+                <span style={healthStatValue}>{formatDurationMs(health.avgLatencyMs24h)}</span>
+              </div>
+              <div style={healthStatRow}>
+                <span style={healthStatLabel}>{t(lang, "healthLatencyMax")}</span>
+                <span style={healthStatValue}>{formatDurationMs(health.maxLatencyMs24h)}</span>
+              </div>
               <div style={healthStatTrend}>{avgTrend}</div>
-              <div style={healthStatRow}>
-                <span style={healthStatLabel}>{t(lang, "healthHoldCount")}</span>
-                <span style={healthStatValue}>{health.holdCount24h}</span>
+                <div style={healthStatRow}>
+                  <span style={healthStatLabel}>{t(lang, "healthHoldCount")}</span>
+                  <span style={healthStatValue}>{health.holdCount24h}</span>
+                </div>
+                <div style={healthStatRow}>
+                  <span style={healthStatLabel}>{t(lang, "healthReviewCount")}</span>
+                  <span style={healthStatValue}>{health.reviewCount24h}</span>
+                </div>
               </div>
-              <div style={healthStatRow}>
-                <span style={healthStatLabel}>{t(lang, "healthReviewCount")}</span>
-                <span style={healthStatValue}>{health.reviewCount24h}</span>
-              </div>
-            </div>
+              {health.errorsLast24h > 0 ? (
+                <div style={healthErrorBlock}>
+                  <div style={healthErrorTitle}>{t(lang, "healthErrorBreakdown")}</div>
+                  <div style={healthErrorList}>
+                    {health.errorCounts.map((item) => (
+                      <div key={item.type} style={healthErrorRow}>
+                        <span style={healthStatLabel}>{errorTypeLabel(item.type, lang)}</span>
+                        <span style={healthStatValue}>{item.count}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : (
+                <div style={healthErrorEmpty}>{t(lang, "healthErrorsNone")}</div>
+              )}
+            </>
           )}
+        </section>
+
+        <section style={cardInner}>
+          <div style={healthPanelTitle}>{t(lang, "healthTrustTitle")}</div>
+          <div style={healthTrustList}>
+            <div style={healthTrustItem}>
+              <span style={healthTrustItemDot} />
+              {t(lang, "healthGuaranteeNoBlock")}
+            </div>
+            <div style={healthTrustItem}>
+              <span style={healthTrustItemDot} />
+              {t(lang, "healthGuaranteeAuditable")}
+            </div>
+            <div style={healthTrustItem}>
+              <span style={healthTrustItemDot} />
+              {t(lang, "healthGuaranteeNoPii")}
+            </div>
+          </div>
+          <div style={healthTrustNote}>{t(lang, "healthReviewReady")}</div>
         </section>
       </div>
     </section>
@@ -2780,6 +2885,15 @@ function formatScore(value: number | null) {
   return value.toFixed(1);
 }
 
+function formatDurationMs(value: number | null) {
+  if (value === null) return "—";
+  if (value < 1000) return `${Math.round(value)} ms`;
+  const seconds = value / 1000;
+  if (seconds < 60) return `${seconds.toFixed(1)} s`;
+  const minutes = seconds / 60;
+  return `${minutes.toFixed(1)} min`;
+}
+
 function formatAge(iso: string | null, lang: Lang) {
   if (!iso) return t(lang, "healthAgeUnknown");
   const date = new Date(iso);
@@ -2806,6 +2920,12 @@ function formatTopic(topic: string | null, lang: Lang) {
   if (topic === "orders/create") return t(lang, "topicOrdersCreate");
   if (topic === "orders/updated") return t(lang, "topicOrdersUpdated");
   return topic;
+}
+
+function errorTypeLabel(type: string, lang: Lang) {
+  if (type === "WEBHOOK_VERIFICATION") return t(lang, "errorTypeVerification");
+  if (type === "SHOPIFY_API") return t(lang, "errorTypeShopifyApi");
+  return t(lang, "errorTypeProcessing");
 }
 
 function shortRulesVersion(version: string) {
@@ -3429,6 +3549,86 @@ const healthStatValue: React.CSSProperties = {
 
 const healthStatTrend: React.CSSProperties = {
   fontSize: 11,
+  color: "#6d7175",
+};
+
+const healthCallout: React.CSSProperties = {
+  marginTop: 10,
+  padding: "8px 10px",
+  borderRadius: 10,
+  background: "#f6f7f8",
+  fontSize: 12,
+  color: "#6d7175",
+  display: "grid",
+  gap: 4,
+};
+
+const healthWarning: React.CSSProperties = {
+  marginTop: 10,
+  padding: "8px 10px",
+  borderRadius: 10,
+  background: "#fff5ea",
+  fontSize: 12,
+  color: "#7a4a00",
+  display: "grid",
+  gap: 4,
+};
+
+const healthTrustList: React.CSSProperties = {
+  display: "grid",
+  gap: 6,
+  fontSize: 12,
+  color: "#202223",
+};
+
+const healthTrustItem: React.CSSProperties = {
+  paddingLeft: 18,
+  position: "relative",
+};
+
+const healthTrustItemDot: React.CSSProperties = {
+  position: "absolute",
+  left: 0,
+  top: 6,
+  width: 6,
+  height: 6,
+  borderRadius: "50%",
+  background: "#9bb7ad",
+};
+
+const healthTrustNote: React.CSSProperties = {
+  marginTop: 10,
+  fontSize: 12,
+  color: "#6d7175",
+};
+
+const healthErrorBlock: React.CSSProperties = {
+  marginTop: 12,
+  paddingTop: 10,
+  borderTop: "1px dashed #e1e3e5",
+};
+
+const healthErrorTitle: React.CSSProperties = {
+  fontSize: 12,
+  fontWeight: 700,
+  marginBottom: 6,
+};
+
+const healthErrorList: React.CSSProperties = {
+  display: "grid",
+  gap: 6,
+};
+
+const healthErrorRow: React.CSSProperties = {
+  display: "flex",
+  justifyContent: "space-between",
+  alignItems: "center",
+  gap: 8,
+};
+
+const healthErrorEmpty: React.CSSProperties = {
+  marginTop: 12,
+  fontSize: 12,
   color: "#6d7175",
 };
 
