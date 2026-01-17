@@ -61,10 +61,28 @@ model RiskResult {
   // ✅ new trust feature
   lastRiskChangeAt DateTime?
 
+  // ✅ manual override
+  manualDecision  String? // "ALLOW" | "HOLD"
+  manualDecisionBy String?
+  manualDecisionAt DateTime?
+
   @@unique([shop, orderGid])
   @@index([shop, createdAt])
   @@index([shop, lastEventAt])
   @@index([shop, lastRiskChangeAt])
+}
+
+model RiskManualDecision {
+  id String @id @default(cuid())
+  shop String
+  orderGid String
+  decision String // "ALLOW" | "HOLD"
+  decidedBy String
+  decidedByType String
+  decidedAt DateTime @default(now())
+
+  @@index([shop, decidedAt])
+  @@index([shop, orderGid, decidedAt])
 }
 
 model RiskRule {
