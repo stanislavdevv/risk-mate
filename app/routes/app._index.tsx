@@ -143,10 +143,17 @@ type HealthState = "HEALTHY" | "DEGRADED" | "UNHEALTHY";
 type HealthSnapshot = {
   state: HealthState;
   lastWebhookAt: string | null;
+  lastWebhookTopic: string | null;
   lastSuccessfulEvalAt: string | null;
   eventsLast24h: number;
   errorsLast24h: number;
   skippedPct24h: number;
+  avgRiskScore24h: number | null;
+  avgRiskScorePrev24h: number | null;
+  holdCount24h: number;
+  reviewCount24h: number;
+  topicCounts: Array<{ topic: string; count: number }>;
+  hasAnyEvents: boolean;
 };
 
 /* ---------- loader ---------- */
@@ -163,7 +170,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
   const shopJson = await shopRes.json();
   const currency = shopJson?.data?.shop?.currencyCode ?? t(lang, "currencyUnknown");
 
-  const tab = (url.searchParams.get("tab") ?? "orders").toLowerCase();
+  const tab = (url.searchParams.get("tab") ?? "queue").toLowerCase();
   const level = (url.searchParams.get("level") ?? "ALL").toUpperCase();
 
   const rules = await prisma.riskRule.findMany({
@@ -319,9 +326,22 @@ export async function loader({ request }: LoaderFunctionArgs) {
 
   const now = Date.now();
   const since24h = new Date(now - 24 * 60 * 60 * 1000);
+  const since48h = new Date(now - 48 * 60 * 60 * 1000);
+
+  const lastEvent = await prisma.riskEvent.findFirst({
+    where: { shop: session.shop },
+    orderBy: { createdAt: "desc" },
+  });
+
   const recentEvents = await prisma.riskEvent.findMany({
     where: { shop: session.shop, createdAt: { gte: since24h } },
     orderBy: { createdAt: "desc" },
+    take: 500,
+  });
+
+  const prevEvents = await prisma.riskEvent.findMany({
+    where: { shop: session.shop, createdAt: { gte: since48h, lt: since24h } },
+    select: { riskScore: true },
     take: 500,
   });
 
@@ -329,7 +349,8 @@ export async function loader({ request }: LoaderFunctionArgs) {
     where: { shop: session.shop, createdAt: { gte: since24h } },
   });
 
-  const lastWebhookAt = recentEvents[0]?.createdAt ?? null;
+  const lastWebhookAt = lastEvent?.createdAt ?? null;
+  const lastWebhookTopic = lastEvent?.topic ?? null;
   const lastSuccess = recentEvents.find((ev) => {
     const summary = (ev as any)?.reasons?.summary;
     return typeof summary === "string" && !summary.toLowerCase().startsWith("skipped");
@@ -342,6 +363,19 @@ export async function loader({ request }: LoaderFunctionArgs) {
   const eventsLast24h = recentEvents.length;
   const skippedPct24h = eventsLast24h ? skippedCount / eventsLast24h : 0;
 
+  const topicMap = new Map<string, number>();
+  for (const ev of recentEvents) {
+    topicMap.set(ev.topic, (topicMap.get(ev.topic) ?? 0) + 1);
+  }
+  const topicCounts = Array.from(topicMap.entries())
+    .map(([topic, count]) => ({ topic, count }))
+    .sort((a, b) => b.count - a.count);
+
+  const avgRiskScore24h = average(recentEvents.map((ev) => ev.riskScore));
+  const avgRiskScorePrev24h = average(prevEvents.map((ev) => ev.riskScore));
+  const holdCount24h = recentEvents.filter((ev) => ev.decision === "HOLD").length;
+  const reviewCount24h = recentEvents.filter((ev) => ev.decision === "REVIEW").length;
+
   let healthState: HealthState = "HEALTHY";
   const ageMinutes = lastWebhookAt ? (now - lastWebhookAt.getTime()) / 60000 : Infinity;
   if (!lastWebhookAt || ageMinutes > 120 || recentErrorsCount > 0) {
@@ -353,10 +387,17 @@ export async function loader({ request }: LoaderFunctionArgs) {
   const health: HealthSnapshot = {
     state: healthState,
     lastWebhookAt: lastWebhookAt ? lastWebhookAt.toISOString() : null,
+    lastWebhookTopic,
     lastSuccessfulEvalAt: lastSuccess ? lastSuccess.toISOString() : null,
     eventsLast24h,
     errorsLast24h: recentErrorsCount,
     skippedPct24h,
+    avgRiskScore24h,
+    avgRiskScorePrev24h,
+    holdCount24h,
+    reviewCount24h,
+    topicCounts,
+    hasAnyEvents: !!lastEvent,
   };
 
   return {
@@ -961,7 +1002,7 @@ export default function AppIndex() {
 
   const lang = (params.get("lang") ? parseLang(params.get("lang")) : data.lang) as Lang;
 
-  const tab = (params.get("tab") ?? "orders").toLowerCase();
+  const tab = (params.get("tab") ?? "queue").toLowerCase();
   const level = (params.get("level") ?? "ALL").toUpperCase();
   const focusedRuleId = params.get("ruleId");
   const [openFactorId, setOpenFactorId] = useState<string | null>(null);
@@ -976,7 +1017,7 @@ export default function AppIndex() {
   const [simulationByOrder, setSimulationByOrder] = useState<Record<string, any>>({});
   const simLoadingOrderGid = simulateFetcher.formData?.get("orderGid");
 
-  type Tab = "queue" | "orders" | "rules" | "events";
+  type Tab = "health" | "queue" | "orders" | "rules" | "events";
 
   const setTab = (next: Tab) => {
     const p = new URLSearchParams(params);
@@ -1095,15 +1136,20 @@ export default function AppIndex() {
         <button type="button" onClick={() => setTab("orders")} style={tabBtn(tab === "orders")}>
           {t(lang, "tabOrders")}
         </button>
-        <button type="button" onClick={() => setTab("rules")} style={tabBtn(tab === "rules")}>
-          {t(lang, "tabRules")}
-        </button>
         <button type="button" onClick={() => setTab("events")} style={tabBtn(tab === "events")}>
           {t(lang, "tabEvents")}
         </button>
+        <button type="button" onClick={() => setTab("rules")} style={tabBtn(tab === "rules")}>
+          {t(lang, "tabRules")}
+        </button>
+        <button type="button" onClick={() => setTab("health")} style={tabBtn(tab === "health")}>
+          {t(lang, "tabHealth")}
+        </button>
       </div>
 
-      {tab === "queue" ? (
+      {tab === "health" ? (
+        <HealthTab data={data} lang={lang} />
+      ) : tab === "queue" ? (
         <QueueTab
           data={data}
           rows={queueRows}
@@ -1586,6 +1632,129 @@ function QueueTab({
             )})}
           </tbody>
         </table>
+      </div>
+    </section>
+  );
+}
+
+/* ---------- Health tab ---------- */
+
+function HealthTab({ data, lang }: { data: LoaderData; lang: Lang }) {
+  const health = data.health;
+
+  if (!health.hasAnyEvents) {
+    return (
+      <section style={card}>
+        <h2 style={h2}>{t(lang, "healthTitle")}</h2>
+        <div style={divider} />
+        <EmptyState title={t(lang, "healthWaitingTitle")}>{t(lang, "healthWaitingBody")}</EmptyState>
+      </section>
+    );
+  }
+
+  const noRecentEvents = health.eventsLast24h === 0;
+  const maxTopicCount = Math.max(1, ...health.topicCounts.map((item) => item.count));
+  const avgTrend = formatTrend(health.avgRiskScore24h, health.avgRiskScorePrev24h, lang);
+
+  return (
+    <section style={card}>
+      <div style={cardHeaderRow}>
+        <div>
+          <h2 style={h2}>{t(lang, "healthTitle")}</h2>
+          <div style={subtle}>{t(lang, "healthSubtitle")}</div>
+        </div>
+      </div>
+
+      <div style={divider} />
+
+      <div style={healthGrid}>
+        <section style={cardInner}>
+          <div style={healthPanelTitle}>{t(lang, "healthOverview")}</div>
+          <div style={healthOverviewRow}>
+            <span style={healthEmojiStyle}>{healthEmoji(health.state)}</span>
+            <span style={healthStateText}>{t(lang, `health_${health.state}`)}</span>
+          </div>
+          <div style={healthStatList}>
+            <div style={healthStatRow}>
+              <span style={healthStatLabel}>
+                {t(lang, "healthLastWebhookAgo", { value: formatAge(health.lastWebhookAt, lang) })}
+              </span>
+            </div>
+            <div style={healthStatRow}>
+              <span style={healthStatLabel}>{t(lang, "healthEventsToday")}</span>
+              <span style={healthStatValue}>{health.eventsLast24h}</span>
+            </div>
+            <div style={healthStatRow}>
+              <span style={healthStatLabel}>{t(lang, "healthErrorsToday")}</span>
+              <span style={healthStatValue}>{health.errorsLast24h}</span>
+            </div>
+          </div>
+        </section>
+
+        <section style={cardInner}>
+          <div style={healthPanelTitle}>{t(lang, "healthWebhookActivity")}</div>
+          {noRecentEvents ? (
+            <div style={healthEmpty}>
+              <div style={{ fontWeight: 600 }}>{t(lang, "healthNoEventsTitle")}</div>
+              <div>{t(lang, "healthNoEventsBody")}</div>
+            </div>
+          ) : (
+            <>
+              <div style={healthStatList}>
+                <div style={healthStatRow}>
+                  <span style={healthStatLabel}>{t(lang, "healthLastWebhookTopic")}</span>
+                  <span style={healthStatValue}>{formatTopic(health.lastWebhookTopic, lang)}</span>
+                </div>
+                <div style={healthStatRow}>
+                  <span style={healthStatLabel}>{t(lang, "healthLastWebhookTime")}</span>
+                  <span style={healthStatValue}>{formatDate(health.lastWebhookAt)}</span>
+                </div>
+              </div>
+              <div style={healthTopicList}>
+                <div style={healthStatLabel}>{t(lang, "healthTopicDistribution")}</div>
+                {health.topicCounts.map((item) => (
+                  <div key={item.topic} style={healthTopicRow}>
+                    <span style={healthTopicLabel}>{formatTopic(item.topic, lang)}</span>
+                    <div style={healthTopicBarWrap}>
+                      <div style={healthTopicBar(item.count / maxTopicCount)} />
+                    </div>
+                    <span style={healthTopicCount}>{item.count}</span>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+        </section>
+
+        <section style={cardInner}>
+          <div style={healthPanelTitle}>{t(lang, "healthProcessingQuality")}</div>
+          {noRecentEvents ? (
+            <div style={healthEmpty}>
+              <div style={{ fontWeight: 600 }}>{t(lang, "healthNoEventsTitle")}</div>
+              <div>{t(lang, "healthNoEventsBody")}</div>
+            </div>
+          ) : (
+            <div style={healthStatList}>
+              <div style={healthStatRow}>
+                <span style={healthStatLabel}>{t(lang, "healthSkippedRate")}</span>
+                <span style={healthStatValue}>{formatPercent(health.skippedPct24h)}</span>
+              </div>
+              <div style={healthStatRow}>
+                <span style={healthStatLabel}>{t(lang, "healthAvgRiskScore")}</span>
+                <span style={healthStatValue}>{formatScore(health.avgRiskScore24h)}</span>
+              </div>
+              <div style={healthStatTrend}>{avgTrend}</div>
+              <div style={healthStatRow}>
+                <span style={healthStatLabel}>{t(lang, "healthHoldCount")}</span>
+                <span style={healthStatValue}>{health.holdCount24h}</span>
+              </div>
+              <div style={healthStatRow}>
+                <span style={healthStatLabel}>{t(lang, "healthReviewCount")}</span>
+                <span style={healthStatValue}>{health.reviewCount24h}</span>
+              </div>
+            </div>
+          )}
+        </section>
       </div>
     </section>
   );
@@ -2600,6 +2769,45 @@ function formatPercent(value: number) {
   return `${pct}%`;
 }
 
+function average(values: number[]) {
+  if (values.length === 0) return null;
+  const sum = values.reduce((total, value) => total + value, 0);
+  return Math.round((sum / values.length) * 10) / 10;
+}
+
+function formatScore(value: number | null) {
+  if (value === null) return "—";
+  return value.toFixed(1);
+}
+
+function formatAge(iso: string | null, lang: Lang) {
+  if (!iso) return t(lang, "healthAgeUnknown");
+  const date = new Date(iso);
+  const diffMs = Date.now() - date.getTime();
+  if (Number.isNaN(diffMs)) return t(lang, "healthAgeUnknown");
+  const minutes = Math.max(0, Math.round(diffMs / 60000));
+  if (minutes < 60) {
+    return t(lang, "healthMinutesAgo", { minutes });
+  }
+  const hours = Math.max(1, Math.round(minutes / 60));
+  return t(lang, "healthHoursAgo", { hours });
+}
+
+function formatTrend(current: number | null, previous: number | null, lang: Lang) {
+  if (current === null || previous === null) return t(lang, "healthTrendUnknown");
+  const diff = Math.round((current - previous) * 10) / 10;
+  if (Math.abs(diff) < 0.1) return t(lang, "healthTrendFlat");
+  if (diff > 0) return t(lang, "healthTrendUp", { value: diff.toFixed(1) });
+  return t(lang, "healthTrendDown", { value: Math.abs(diff).toFixed(1) });
+}
+
+function formatTopic(topic: string | null, lang: Lang) {
+  if (!topic) return t(lang, "healthTopicUnknown");
+  if (topic === "orders/create") return t(lang, "topicOrdersCreate");
+  if (topic === "orders/updated") return t(lang, "topicOrdersUpdated");
+  return topic;
+}
+
 function shortRulesVersion(version: string) {
   return version.length > 8 ? version.slice(0, 8) : version;
 }
@@ -3168,6 +3376,107 @@ const healthMetaItem: React.CSSProperties = {
   whiteSpace: "nowrap",
 };
 
+const healthGrid: React.CSSProperties = {
+  display: "grid",
+  gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))",
+  gap: 12,
+};
+
+const healthPanelTitle: React.CSSProperties = {
+  fontWeight: 700,
+  marginBottom: 8,
+};
+
+const healthOverviewRow: React.CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  gap: 8,
+  marginBottom: 8,
+};
+
+const healthEmojiStyle: React.CSSProperties = {
+  fontSize: 20,
+};
+
+const healthStateText: React.CSSProperties = {
+  fontSize: 12,
+  fontWeight: 800,
+  textTransform: "uppercase",
+  letterSpacing: "0.04em",
+};
+
+const healthStatList: React.CSSProperties = {
+  display: "grid",
+  gap: 6,
+};
+
+const healthStatRow: React.CSSProperties = {
+  display: "flex",
+  justifyContent: "space-between",
+  alignItems: "center",
+  gap: 8,
+};
+
+const healthStatLabel: React.CSSProperties = {
+  fontSize: 12,
+  color: "#6d7175",
+};
+
+const healthStatValue: React.CSSProperties = {
+  fontSize: 12,
+  fontWeight: 700,
+};
+
+const healthStatTrend: React.CSSProperties = {
+  fontSize: 11,
+  color: "#6d7175",
+};
+
+const healthTopicList: React.CSSProperties = {
+  display: "grid",
+  gap: 6,
+  marginTop: 10,
+};
+
+const healthTopicRow: React.CSSProperties = {
+  display: "grid",
+  gridTemplateColumns: "minmax(120px, 1fr) 1fr auto",
+  alignItems: "center",
+  gap: 8,
+};
+
+const healthTopicLabel: React.CSSProperties = {
+  fontSize: 12,
+  color: "#202223",
+};
+
+const healthTopicBarWrap: React.CSSProperties = {
+  height: 6,
+  background: "#f1f2f3",
+  borderRadius: 999,
+  overflow: "hidden",
+};
+
+function healthTopicBar(ratio: number): React.CSSProperties {
+  return {
+    height: "100%",
+    width: `${Math.round(ratio * 100)}%`,
+    background: "#9bb7ad",
+  };
+}
+
+const healthTopicCount: React.CSSProperties = {
+  fontSize: 12,
+  fontWeight: 700,
+};
+
+const healthEmpty: React.CSSProperties = {
+  display: "grid",
+  gap: 4,
+  fontSize: 12,
+  color: "#6d7175",
+};
+
 function healthPill(state: HealthState): React.CSSProperties {
   const map = {
     HEALTHY: { bg: "#eafbea", bd: "#bfe6bf", fg: "#0f5132" },
@@ -3186,4 +3495,10 @@ function healthPill(state: HealthState): React.CSSProperties {
     textTransform: "uppercase",
     letterSpacing: "0.04em",
   };
+}
+
+function healthEmoji(state: HealthState) {
+  if (state === "HEALTHY") return "🟢";
+  if (state === "DEGRADED") return "🟡";
+  return "🔴";
 }
