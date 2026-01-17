@@ -72,6 +72,18 @@ model RiskResult {
   @@index([shop, lastRiskChangeAt])
 }
 
+model RiskNote {
+  id String @id @default(cuid())
+  shop String
+  orderGid String
+  body String
+  createdBy String
+  createdByType String
+  createdAt DateTime @default(now())
+
+  @@index([shop, orderGid, createdAt])
+}
+
 model RiskManualDecision {
   id String @id @default(cuid())
   shop String
