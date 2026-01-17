@@ -138,6 +138,17 @@ type SimFactor = {
   ruleType: string;
 };
 
+type HealthState = "HEALTHY" | "DEGRADED" | "UNHEALTHY";
+
+type HealthSnapshot = {
+  state: HealthState;
+  lastWebhookAt: string | null;
+  lastSuccessfulEvalAt: string | null;
+  eventsLast24h: number;
+  errorsLast24h: number;
+  skippedPct24h: number;
+};
+
 /* ---------- loader ---------- */
 
 export async function loader({ request }: LoaderFunctionArgs) {
@@ -306,6 +317,48 @@ export async function loader({ request }: LoaderFunctionArgs) {
     }
   }
 
+  const now = Date.now();
+  const since24h = new Date(now - 24 * 60 * 60 * 1000);
+  const recentEvents = await prisma.riskEvent.findMany({
+    where: { shop: session.shop, createdAt: { gte: since24h } },
+    orderBy: { createdAt: "desc" },
+    take: 500,
+  });
+
+  const recentErrorsCount = await prisma.riskProcessingError.count({
+    where: { shop: session.shop, createdAt: { gte: since24h } },
+  });
+
+  const lastWebhookAt = recentEvents[0]?.createdAt ?? null;
+  const lastSuccess = recentEvents.find((ev) => {
+    const summary = (ev as any)?.reasons?.summary;
+    return typeof summary === "string" && !summary.toLowerCase().startsWith("skipped");
+  })?.createdAt ?? null;
+
+  const skippedCount = recentEvents.filter((ev) => {
+    const summary = (ev as any)?.reasons?.summary;
+    return typeof summary === "string" && summary.toLowerCase().startsWith("skipped");
+  }).length;
+  const eventsLast24h = recentEvents.length;
+  const skippedPct24h = eventsLast24h ? skippedCount / eventsLast24h : 0;
+
+  let healthState: HealthState = "HEALTHY";
+  const ageMinutes = lastWebhookAt ? (now - lastWebhookAt.getTime()) / 60000 : Infinity;
+  if (!lastWebhookAt || ageMinutes > 120 || recentErrorsCount > 0) {
+    healthState = "UNHEALTHY";
+  } else if (ageMinutes > 30 || skippedPct24h >= 0.6) {
+    healthState = "DEGRADED";
+  }
+
+  const health: HealthSnapshot = {
+    state: healthState,
+    lastWebhookAt: lastWebhookAt ? lastWebhookAt.toISOString() : null,
+    lastSuccessfulEvalAt: lastSuccess ? lastSuccess.toISOString() : null,
+    eventsLast24h,
+    errorsLast24h: recentErrorsCount,
+    skippedPct24h,
+  };
+
   return {
     shop: session.shop,
     currency,
@@ -321,6 +374,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
     hasMoreRuleChanges,
     queueRows,
     notesByOrder,
+    health,
     rules: rules.map(
       (r): Rule => ({
         id: r.id,
@@ -1001,7 +1055,29 @@ export default function AppIndex() {
           </div>
         </div>
 
-        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          <div style={healthCard}>
+            <div style={healthRow}>
+              <span style={healthPill(data.health.state)}>{t(lang, `health_${data.health.state}`)}</span>
+              <span style={healthText}>
+                {t(lang, "healthLastWebhook")}: {formatDate(data.health.lastWebhookAt)}
+              </span>
+            </div>
+            <div style={healthMeta}>
+              <span style={healthMetaItem}>
+                {t(lang, "healthLastSuccess")}: {formatDate(data.health.lastSuccessfulEvalAt)}
+              </span>
+              <span style={healthMetaItem}>
+                {t(lang, "healthEvents24h")}: {data.health.eventsLast24h}
+              </span>
+              <span style={healthMetaItem}>
+                {t(lang, "healthErrors24h")}: {data.health.errorsLast24h}
+              </span>
+              <span style={healthMetaItem}>
+                {t(lang, "healthSkipped24h")}: {formatPercent(data.health.skippedPct24h)}
+              </span>
+            </div>
+          </div>
           <select value={lang} onChange={(e) => setLang(e.target.value as Lang)} style={langSelect}>
             {SUPPORTED_LANGS.map((l) => (
               <option key={l} value={l}>
@@ -2519,6 +2595,11 @@ function formatDate(iso: string | null | undefined) {
   return d.toLocaleString();
 }
 
+function formatPercent(value: number) {
+  const pct = Math.round(value * 100);
+  return `${pct}%`;
+}
+
 function shortRulesVersion(version: string) {
   return version.length > 8 ? version.slice(0, 8) : version;
 }
@@ -3046,5 +3127,63 @@ function pillMini(kind: "ok" | "warn"): React.CSSProperties {
     background: kind === "ok" ? "#eafbea" : "#fff5ea",
     color: kind === "ok" ? "#0f5132" : "#7a4a00",
     whiteSpace: "nowrap",
+  };
+}
+
+const healthCard: React.CSSProperties = {
+  display: "flex",
+  flexDirection: "column",
+  alignItems: "flex-start",
+  gap: 6,
+  padding: "6px 10px",
+  borderRadius: 12,
+  border: "1px solid #e1e3e5",
+  background: "#ffffff",
+  fontSize: 12,
+  color: "#6d7175",
+};
+
+const healthRow: React.CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  gap: 8,
+};
+
+const healthText: React.CSSProperties = {
+  fontSize: 12,
+  color: "#6d7175",
+  whiteSpace: "nowrap",
+};
+
+const healthMeta: React.CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  flexWrap: "wrap",
+  gap: 10,
+  fontSize: 11,
+  color: "#6d7175",
+};
+
+const healthMetaItem: React.CSSProperties = {
+  whiteSpace: "nowrap",
+};
+
+function healthPill(state: HealthState): React.CSSProperties {
+  const map = {
+    HEALTHY: { bg: "#eafbea", bd: "#bfe6bf", fg: "#0f5132" },
+    DEGRADED: { bg: "#fff5ea", bd: "#f2d3a5", fg: "#7a4a00" },
+    UNHEALTHY: { bg: "#fbeae5", bd: "#f3c0b2", fg: "#8a2a0a" },
+  } as const;
+  const tone = map[state];
+  return {
+    padding: "2px 8px",
+    borderRadius: 999,
+    border: `1px solid ${tone.bd}`,
+    background: tone.bg,
+    color: tone.fg,
+    fontWeight: 800,
+    fontSize: 11,
+    textTransform: "uppercase",
+    letterSpacing: "0.04em",
   };
 }

@@ -84,6 +84,17 @@ model RiskNote {
   @@index([shop, orderGid, createdAt])
 }
 
+model RiskProcessingError {
+  id String @id @default(cuid())
+  shop String
+  topic String?
+  orderGid String?
+  message String
+  createdAt DateTime @default(now())
+
+  @@index([shop, createdAt])
+}
+
 model RiskManualDecision {
   id String @id @default(cuid())
   shop String
