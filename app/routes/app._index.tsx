@@ -27,6 +27,12 @@ type ActionData =
     }
   | {
       ok: true;
+      op: "addNote";
+      orderGid: string;
+      note: NoteItem;
+    }
+  | {
+      ok: true;
       op: "simulate";
       orderGid: string;
       current: { decision: string; score: number; factors: SimFactor[] };
@@ -81,6 +87,13 @@ type QueueRow = {
   manualDecision: "ALLOW" | "HOLD" | null;
   manualDecisionBy: string | null;
   manualDecisionAt: string | null;
+};
+
+type NoteItem = {
+  id: string;
+  body: string;
+  createdAt: string;
+  createdBy: string;
 };
 
 type RiskEventRow = {
@@ -273,6 +286,26 @@ export async function loader({ request }: LoaderFunctionArgs) {
       return bTime - aTime;
     });
 
+  const noteOrderGids = Array.from(new Set([...orderGids, ...queueRows.map((row) => row.orderGid)]));
+  const notesByOrder: Record<string, NoteItem[]> = {};
+  if (noteOrderGids.length > 0) {
+    const notes = await prisma.riskNote.findMany({
+      where: { shop: session.shop, orderGid: { in: noteOrderGids } },
+      orderBy: { createdAt: "desc" },
+    });
+    for (const note of notes) {
+      const bucket = notesByOrder[note.orderGid] ?? [];
+      if (bucket.length >= 5) continue;
+      bucket.push({
+        id: note.id,
+        body: note.body,
+        createdAt: note.createdAt.toISOString(),
+        createdBy: note.createdBy,
+      });
+      notesByOrder[note.orderGid] = bucket;
+    }
+  }
+
   return {
     shop: session.shop,
     currency,
@@ -287,6 +320,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
     ruleChanges: initialRuleChanges,
     hasMoreRuleChanges,
     queueRows,
+    notesByOrder,
     rules: rules.map(
       (r): Rule => ({
         id: r.id,
@@ -586,6 +620,39 @@ export async function action({ request }: ActionFunctionArgs) {
     });
   }
 
+  if (intent === "addNote") {
+    const orderGid = String(form.get("orderGid") ?? "").trim();
+    const body = String(form.get("body") ?? "").trim();
+    if (!orderGid) {
+      return json<ActionData>({ ok: false, error: t(lang, "errorMissingOrderGid") }, 400);
+    }
+    if (!body) {
+      return json<ActionData>({ ok: false, error: t(lang, "errorNoteEmpty") }, 400);
+    }
+
+    const created = await prisma.riskNote.create({
+      data: {
+        shop: session.shop,
+        orderGid,
+        body,
+        createdBy: session.shop,
+        createdByType: "SHOP",
+      },
+    });
+
+    return json<ActionData>({
+      ok: true,
+      op: "addNote",
+      orderGid,
+      note: {
+        id: created.id,
+        body: created.body,
+        createdAt: created.createdAt.toISOString(),
+        createdBy: created.createdBy,
+      },
+    });
+  }
+
   const allowedTypes: RuleType[] = ["ORDER_VALUE", "FIRST_TIME", "HIGH_QTY", "COUNTRY_MISMATCH"];
   const allowedOps: RuleOp[] = [">", ">=", "=", "!=", "<", "<="];
   const allowedStatuses: RuleStatus[] = ["DRAFT", "ACTIVE", "DEPRECATED"];
@@ -846,9 +913,12 @@ export default function AppIndex() {
   const [openFactorId, setOpenFactorId] = useState<string | null>(null);
   const [openRulesetId, setOpenRulesetId] = useState<string | null>(null);
   const [openQueueReasonId, setOpenQueueReasonId] = useState<string | null>(null);
+  const [openNotesId, setOpenNotesId] = useState<string | null>(null);
   const [queueRows, setQueueRows] = useState<QueueRow[]>(data.queueRows);
+  const [notesByOrder, setNotesByOrder] = useState<Record<string, NoteItem[]>>(data.notesByOrder ?? {});
   const simulateFetcher = useFetcher<ActionData>();
   const manualFetcher = useFetcher<ActionData>();
+  const noteFetcher = useFetcher<ActionData>();
   const [simulationByOrder, setSimulationByOrder] = useState<Record<string, any>>({});
   const simLoadingOrderGid = simulateFetcher.formData?.get("orderGid");
 
@@ -871,6 +941,10 @@ export default function AppIndex() {
   }, [data.queueRows]);
 
   useEffect(() => {
+    setNotesByOrder(data.notesByOrder ?? {});
+  }, [data.notesByOrder]);
+
+  useEffect(() => {
     const d = manualFetcher.data;
     if (!d || !d.ok || d.op !== "manualDecision") return;
     setQueueRows((prev) => {
@@ -890,6 +964,18 @@ export default function AppIndex() {
       );
     });
   }, [manualFetcher.data]);
+
+  useEffect(() => {
+    const d = noteFetcher.data;
+    if (!d || !d.ok || d.op !== "addNote") return;
+    setNotesByOrder((prev) => {
+      const existing = prev[d.orderGid] ?? [];
+      return {
+        ...prev,
+        [d.orderGid]: [d.note, ...existing].slice(0, 5),
+      };
+    });
+  }, [noteFetcher.data]);
 
   const setLevel = (lvl: string) => {
     const p = new URLSearchParams(params);
@@ -945,10 +1031,14 @@ export default function AppIndex() {
         <QueueTab
           data={data}
           rows={queueRows}
+          notesByOrder={notesByOrder}
           lang={lang}
           openQueueReasonId={openQueueReasonId}
           setOpenQueueReasonId={setOpenQueueReasonId}
+          openNotesId={openNotesId}
+          setOpenNotesId={setOpenNotesId}
           manualFetcher={manualFetcher}
+          noteFetcher={noteFetcher}
         />
       ) : tab === "orders" ? (
         <>
@@ -1030,6 +1120,16 @@ export default function AppIndex() {
                                 ) : null}
                               </div>
                             ) : null}
+                            <div style={{ marginTop: 6 }}>
+                              <NotesPopover
+                                orderGid={r.orderGid}
+                                notes={notesByOrder[r.orderGid] ?? []}
+                                lang={lang}
+                                openNotesId={openNotesId}
+                                setOpenNotesId={setOpenNotesId}
+                                noteFetcher={noteFetcher}
+                              />
+                            </div>
                           </div>
                           <div style={{ marginTop: 6 }}>
                             <simulateFetcher.Form method="post" action="?index" style={{ display: "inline-block" }}>
@@ -1226,17 +1326,25 @@ export default function AppIndex() {
 function QueueTab({
   data,
   rows,
+  notesByOrder,
   lang,
   openQueueReasonId,
   setOpenQueueReasonId,
+  openNotesId,
+  setOpenNotesId,
   manualFetcher,
+  noteFetcher,
 }: {
   data: LoaderData;
   rows: QueueRow[];
+  notesByOrder: Record<string, NoteItem[]>;
   lang: Lang;
   openQueueReasonId: string | null;
   setOpenQueueReasonId: (next: string | null) => void;
+  openNotesId: string | null;
+  setOpenNotesId: (next: string | null) => void;
   manualFetcher: ReturnType<typeof useFetcher<ActionData>>;
+  noteFetcher: ReturnType<typeof useFetcher<ActionData>>;
 }) {
   if (rows.length === 0) {
     if (!data.hasActiveRules || !data.hasEnabledActiveRules) {
@@ -1283,7 +1391,9 @@ function QueueTab({
             </tr>
           </thead>
           <tbody>
-            {rows.map((row) => (
+            {rows.map((row) => {
+              const notes = notesByOrder[row.orderGid] ?? [];
+              return (
               <tr key={row.id}>
                 <td style={td}>{formatDate(row.lastEventAt ?? row.updatedAt)}</td>
                 <td style={tdStrong}>
@@ -1348,6 +1458,16 @@ function QueueTab({
                       ) : null}
                     </div>
                   ) : null}
+                  <div style={{ marginTop: 8 }}>
+                    <NotesPopover
+                      orderGid={row.orderGid}
+                      notes={notes}
+                      lang={lang}
+                      openNotesId={openNotesId}
+                      setOpenNotesId={setOpenNotesId}
+                      noteFetcher={noteFetcher}
+                    />
+                  </div>
                 </td>
                 <td style={td}>
                   <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
@@ -1387,11 +1507,81 @@ function QueueTab({
                   )}
                 </td>
               </tr>
-            ))}
+            )})}
           </tbody>
         </table>
       </div>
     </section>
+  );
+}
+
+function NotesPopover({
+  orderGid,
+  notes,
+  lang,
+  openNotesId,
+  setOpenNotesId,
+  noteFetcher,
+}: {
+  orderGid: string;
+  notes: NoteItem[];
+  lang: Lang;
+  openNotesId: string | null;
+  setOpenNotesId: (next: string | null) => void;
+  noteFetcher: ReturnType<typeof useFetcher<ActionData>>;
+}) {
+  const isOpen = openNotesId === orderGid;
+  return (
+    <span
+      style={{ position: "relative", display: "inline-flex" }}
+      onBlur={(event) => {
+        const next = event.relatedTarget as Node | null;
+        if (next && event.currentTarget.contains(next)) return;
+        setOpenNotesId(null);
+      }}
+    >
+      <span
+        style={popoverTrigger}
+        tabIndex={0}
+        onClick={() => setOpenNotesId(isOpen ? null : orderGid)}
+      >
+        <span style={queueDetailsTag}>{t(lang, "notesLink")}</span>
+      </span>
+      {isOpen ? (
+        <div style={{ ...popoverCard, minWidth: 260 }}>
+          <div style={{ fontWeight: 700, marginBottom: 6 }}>{t(lang, "notesLabel")}</div>
+          {notes.length ? (
+            <div style={{ display: "grid", gap: 6 }}>
+              {notes.map((note) => (
+                <div key={note.id} style={{ fontSize: 12 }}>
+                  <div style={{ color: "#202223" }}>{note.body}</div>
+                  <div style={{ color: "#6d7175" }}>
+                    {note.createdBy} · {formatDate(note.createdAt)}
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div style={{ fontSize: 12, color: "#6d7175" }}>{t(lang, "notesEmpty")}</div>
+          )}
+          <div style={{ marginTop: 8 }}>
+            <noteFetcher.Form method="post" action="?index" style={{ display: "grid", gap: 6 }}>
+              <input type="hidden" name="_action" value="addNote" />
+              <input type="hidden" name="orderGid" value={orderGid} />
+              <textarea
+                name="body"
+                placeholder={t(lang, "notePlaceholder")}
+                style={noteTextarea}
+                rows={2}
+              />
+              <button type="submit" style={secondaryBtn} disabled={noteFetcher.state !== "idle"}>
+                {t(lang, "addNote")}
+              </button>
+            </noteFetcher.Form>
+          </div>
+        </div>
+      ) : null}
+    </span>
   );
 }
 
@@ -2498,6 +2688,17 @@ const link: React.CSSProperties = {
   color: "#005bd3",
   textDecoration: "none",
   fontWeight: 600,
+};
+
+const noteTextarea: React.CSSProperties = {
+  width: "100%",
+  boxSizing: "border-box",
+  minWidth: 0,
+  padding: "8px 10px",
+  borderRadius: 10,
+  border: "1px solid #dfe3e8",
+  fontSize: 12,
+  resize: "vertical",
 };
 
 const codeInline: React.CSSProperties = {
