@@ -76,6 +76,7 @@ async function createRiskEvent(input: {
   source: "ORDERS_CREATE" | "ORDERS_UPDATED";
   topic: string;
   webhookId: string | null;
+  webhookReceivedAt: Date;
   rulesVersion: string;
   rulesSnapshot: any[] | null;
   snapshot: any;
@@ -92,6 +93,7 @@ async function createRiskEvent(input: {
       source: input.source,
       topic: input.topic,
       webhookId: input.webhookId,
+      webhookReceivedAt: input.webhookReceivedAt,
       rulesVersion: input.rulesVersion,
       rulesSnapshot: input.rulesSnapshot ?? undefined,
       snapshot: input.snapshot,
@@ -188,8 +190,25 @@ export async function action({ request }: ActionFunctionArgs) {
   let shop: string | null = null;
   let topic: string | null = null;
   let orderGid: string | null = null;
+  const webhookReceivedAt = new Date();
   try {
-    const auth = await authenticate.webhook(request);
+    let auth: Awaited<ReturnType<typeof authenticate.webhook>>;
+    try {
+      auth = await authenticate.webhook(request);
+    } catch (err: any) {
+      const headerShop = shopFromWebhookHeaders(request);
+      if (headerShop) {
+        await recordWebhookError({
+          shop: headerShop,
+          type: "WEBHOOK_VERIFICATION",
+          topic: null,
+          orderGid: null,
+          message: String(err?.message ?? err).slice(0, 500),
+        });
+      }
+      console.error("[RiskMate] webhook verification error", err?.message ?? err, err?.stack ?? "");
+      return new Response("OK");
+    }
     topic = auth.topic;
     shop = auth.shop;
     const { payload, admin } = auth;
@@ -258,6 +277,7 @@ export async function action({ request }: ActionFunctionArgs) {
           source,
           topic: t,
           webhookId: webhookIdFromHeaders(request),
+          webhookReceivedAt,
           rulesVersion,
           rulesSnapshot,
           snapshot: stable,
@@ -309,6 +329,7 @@ export async function action({ request }: ActionFunctionArgs) {
         source,
         topic: t,
         webhookId: webhookIdFromHeaders(request),
+        webhookReceivedAt,
         rulesVersion: computed.rulesVersion,
         rulesSnapshot: computed.rulesSnapshot,
         snapshot: stable,
@@ -325,28 +346,62 @@ export async function action({ request }: ActionFunctionArgs) {
     }
 
     // 4) Side-effects in Shopify (только если реально изменился risk)
-    await setOrderRiskTags(admin, orderGid, {
-      level: riskLevel,
-      extra: [], // MVP: никаких дополнительных тегов
-      cleanStatusTags: true,
-    });
+    try {
+      await setOrderRiskTags(admin, orderGid, {
+        level: riskLevel,
+        extra: [], // MVP: никаких дополнительных тегов
+        cleanStatusTags: true,
+      });
 
-    await createOrderRiskAssessment(admin, orderGid, riskLevel, computed?.facts);
+      await createOrderRiskAssessment(admin, orderGid, riskLevel, computed?.facts);
+    } catch (err: any) {
+      await recordWebhookError({
+        shop,
+        type: "SHOPIFY_API",
+        topic: t,
+        orderGid,
+        message: String(err?.message ?? err).slice(0, 500),
+      });
+      console.error("[RiskMate] shopify api error", err?.message ?? err, err?.stack ?? "");
+      return new Response("OK");
+    }
 
     return new Response("OK");
   } catch (err: any) {
     console.error("[RiskMate] webhook error", err?.message ?? err, err?.stack ?? "");
     if (shop) {
-      await prisma.riskProcessingError.create({
-        data: {
-          shop,
-          topic: topic ?? undefined,
-          orderGid: orderGid ?? undefined,
-          message: String(err?.message ?? err).slice(0, 500),
-        },
+      await recordWebhookError({
+        shop,
+        type: "PROCESSING",
+        topic: topic ?? null,
+        orderGid: orderGid ?? null,
+        message: String(err?.message ?? err).slice(0, 500),
       });
     }
     // Shopify webhooks: всегда 200 OK, чтобы не было бесконечных ретраев
     return new Response("OK");
   }
+}
+
+function shopFromWebhookHeaders(request: Request) {
+  const h = request.headers;
+  return h.get("x-shopify-shop-domain") || h.get("X-Shopify-Shop-Domain") || null;
+}
+
+async function recordWebhookError(input: {
+  shop: string;
+  type: "WEBHOOK_VERIFICATION" | "PROCESSING" | "SHOPIFY_API";
+  topic: string | null;
+  orderGid: string | null;
+  message: string;
+}) {
+  await prisma.riskProcessingError.create({
+    data: {
+      shop: input.shop,
+      type: input.type,
+      topic: input.topic ?? undefined,
+      orderGid: input.orderGid ?? undefined,
+      message: input.message,
+    },
+  });
 }

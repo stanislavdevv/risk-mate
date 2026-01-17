@@ -87,12 +87,19 @@ model RiskNote {
 model RiskProcessingError {
   id String @id @default(cuid())
   shop String
+  type RiskProcessingErrorType @default(PROCESSING)
   topic String?
   orderGid String?
   message String
   createdAt DateTime @default(now())
 
   @@index([shop, createdAt])
+}
+
+enum RiskProcessingErrorType {
+  WEBHOOK_VERIFICATION
+  PROCESSING
+  SHOPIFY_API
 }
 
 model RiskManualDecision {
@@ -183,6 +190,7 @@ model RiskEvent {
   source    RiskEventSource
   topic     String // e.g. "orders/create"
   webhookId String? // if you can extract Shopify webhook id/header
+  webhookReceivedAt DateTime?
   createdAt DateTime        @default(now())
 
   // core data
