@@ -185,8 +185,14 @@ function buildReasonsV2FromString(reasonsJson: string | null | undefined) {
 // ---------------- route ----------------
 
 export async function action({ request }: ActionFunctionArgs) {
+  let shop: string | null = null;
+  let topic: string | null = null;
+  let orderGid: string | null = null;
   try {
-    const { topic, shop, payload, admin } = await authenticate.webhook(request);
+    const auth = await authenticate.webhook(request);
+    topic = auth.topic;
+    shop = auth.shop;
+    const { payload, admin } = auth;
     const t = normalizeTopic(topic);
 
     console.log("[RiskMate] webhook received", { shop, topic: t });
@@ -200,7 +206,7 @@ export async function action({ request }: ActionFunctionArgs) {
     // only create/update for now (paid can stay in allow-list but we won't map it to source)
     if (!ALLOWED_TOPICS.has(t)) return new Response("OK");
 
-    const orderGid = (payload as any)?.admin_graphql_api_id as string | undefined;
+    orderGid = ((payload as any)?.admin_graphql_api_id as string | undefined) ?? null;
     const orderName = (payload as any)?.name as string | undefined;
 
     if (!orderGid) {
@@ -330,6 +336,16 @@ export async function action({ request }: ActionFunctionArgs) {
     return new Response("OK");
   } catch (err: any) {
     console.error("[RiskMate] webhook error", err?.message ?? err, err?.stack ?? "");
+    if (shop) {
+      await prisma.riskProcessingError.create({
+        data: {
+          shop,
+          topic: topic ?? undefined,
+          orderGid: orderGid ?? undefined,
+          message: String(err?.message ?? err).slice(0, 500),
+        },
+      });
+    }
     // Shopify webhooks: всегда 200 OK, чтобы не было бесконечных ретраев
     return new Response("OK");
   }
