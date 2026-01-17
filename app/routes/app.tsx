@@ -24,7 +24,6 @@ export default function App() {
     <AppProvider embedded apiKey={apiKey}>
       <s-app-nav>
         <s-link href={`/app${langQuery}`}>{t(lang, "navHome")}</s-link>
-        <s-link href={`/app/additional${langQuery}`}>{t(lang, "navAdditional")}</s-link>
       </s-app-nav>
       <Outlet />
     </AppProvider>
