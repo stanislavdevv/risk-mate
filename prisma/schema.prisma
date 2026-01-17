@@ -78,7 +78,7 @@ model RiskRule {
 
   action  String? // TAG:high_risk | HOLD | REVIEW
   enabled Boolean @default(true)
-  status  RuleStatus @default(ACTIVE)
+  status  RuleStatus @default(DRAFT)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt

@@ -23,7 +23,7 @@ export type RuleFactor = {
   status: string;
 };
 
-function buildEvidence(rule: RiskRule, ctx: OrderContext) {
+function buildEvidence(rule: RiskRule, ctx: OrderContext): Record<string, string | number | boolean | null> {
   switch (rule.type) {
     case "ORDER_VALUE":
       return { orderTotal: ctx.orderTotal };
