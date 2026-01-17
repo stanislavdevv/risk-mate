@@ -19,6 +19,14 @@ type ActionData =
   | { ok: true; op: "loadRuleHistory"; items: RuleChange[]; hasMore: boolean }
   | {
       ok: true;
+      op: "manualDecision";
+      orderGid: string;
+      decision: "ALLOW" | "HOLD";
+      decidedBy: string;
+      decidedAt: string;
+    }
+  | {
+      ok: true;
       op: "simulate";
       orderGid: string;
       current: { decision: string; score: number; factors: SimFactor[] };
@@ -70,6 +78,9 @@ type QueueRow = {
   factors: any[];
   lastEventAt: string | null;
   updatedAt: string;
+  manualDecision: "ALLOW" | "HOLD" | null;
+  manualDecisionBy: string | null;
+  manualDecisionAt: string | null;
 };
 
 type RiskEventRow = {
@@ -103,6 +114,9 @@ type Row = {
   lastRiskChangeAt: string | null;
   lastDecision: string | null;
   skipReason: string | null;
+  manualDecision: "ALLOW" | "HOLD" | null;
+  manualDecisionBy: string | null;
+  manualDecisionAt: string | null;
 };
 
 type SimFactor = {
@@ -213,7 +227,13 @@ export async function loader({ request }: LoaderFunctionArgs) {
   const toIso = (d: Date | null | undefined) => (d ? d.toISOString() : null);
 
   const queueItems = await prisma.riskResult.findMany({
-    where: { shop: session.shop, riskLevel: { in: ["HIGH", "MEDIUM"] } },
+    where: {
+      shop: session.shop,
+      OR: [
+        { manualDecision: "HOLD" },
+        { manualDecision: null, riskLevel: { in: ["HIGH", "MEDIUM"] } },
+      ],
+    },
     orderBy: [{ lastEventAt: "desc" }, { updatedAt: "desc" }],
     take: 100,
   });
@@ -223,7 +243,9 @@ export async function loader({ request }: LoaderFunctionArgs) {
       const orderId = orderIdFromGid(it.orderGid);
       const orderAdminUrl = orderId ? shopifyAdminOrderUrl(session.shop, orderId) : null;
       const parsed = parseReasonsPayload(it.reasonsJson);
-      const decision: QueueRow["decision"] = it.riskLevel === "HIGH" ? "HOLD" : "REVIEW";
+      const manualDecision = (it as any).manualDecision as QueueRow["manualDecision"] | null;
+      const decision: QueueRow["decision"] =
+        manualDecision === "HOLD" ? "HOLD" : it.riskLevel === "HIGH" ? "HOLD" : "REVIEW";
       return {
         id: it.id,
         orderGid: it.orderGid,
@@ -236,6 +258,9 @@ export async function loader({ request }: LoaderFunctionArgs) {
         factors: parsed.factors,
         lastEventAt: toIso(it.lastEventAt),
         updatedAt: it.updatedAt.toISOString(),
+        manualDecision,
+        manualDecisionBy: (it as any).manualDecisionBy ?? null,
+        manualDecisionAt: (it as any).manualDecisionAt ? (it as any).manualDecisionAt.toISOString() : null,
       };
     })
     .sort((a, b) => {
@@ -340,6 +365,11 @@ export async function loader({ request }: LoaderFunctionArgs) {
             normalizeSkipReason(latestEvent?.skipReason ?? null) ??
             normalizeSkipReason((it as any).skipReason) ??
             null,
+          manualDecision: (it as any).manualDecision ?? null,
+          manualDecisionBy: (it as any).manualDecisionBy ?? null,
+          manualDecisionAt: (it as any).manualDecisionAt
+            ? (it as any).manualDecisionAt.toISOString()
+            : null,
         };
       },
     ),
@@ -512,6 +542,47 @@ export async function action({ request }: ActionFunctionArgs) {
       op: "loadRuleHistory",
       items,
       hasMore: changes.length > 5,
+    });
+  }
+
+  if (intent === "manualDecision") {
+    const orderGid = String(form.get("orderGid") ?? "").trim();
+    const decision = String(form.get("decision") ?? "").trim().toUpperCase();
+    if (!orderGid) {
+      return json<ActionData>({ ok: false, error: t(lang, "errorMissingOrderGid") }, 400);
+    }
+    if (decision !== "ALLOW" && decision !== "HOLD") {
+      return json<ActionData>({ ok: false, error: t(lang, "errorInvalidManualDecision") }, 400);
+    }
+
+    const decidedAt = new Date();
+    await prisma.riskResult.update({
+      where: { shop_orderGid: { shop: session.shop, orderGid } },
+      data: {
+        manualDecision: decision,
+        manualDecisionBy: session.shop,
+        manualDecisionAt: decidedAt,
+      },
+    });
+
+    await prisma.riskManualDecision.create({
+      data: {
+        shop: session.shop,
+        orderGid,
+        decision,
+        decidedBy: session.shop,
+        decidedByType: "SHOP",
+        decidedAt,
+      },
+    });
+
+    return json<ActionData>({
+      ok: true,
+      op: "manualDecision",
+      orderGid,
+      decision: decision as "ALLOW" | "HOLD",
+      decidedBy: session.shop,
+      decidedAt: decidedAt.toISOString(),
     });
   }
 
@@ -775,7 +846,9 @@ export default function AppIndex() {
   const [openFactorId, setOpenFactorId] = useState<string | null>(null);
   const [openRulesetId, setOpenRulesetId] = useState<string | null>(null);
   const [openQueueReasonId, setOpenQueueReasonId] = useState<string | null>(null);
+  const [queueRows, setQueueRows] = useState<QueueRow[]>(data.queueRows);
   const simulateFetcher = useFetcher<ActionData>();
+  const manualFetcher = useFetcher<ActionData>();
   const [simulationByOrder, setSimulationByOrder] = useState<Record<string, any>>({});
   const simLoadingOrderGid = simulateFetcher.formData?.get("orderGid");
 
@@ -792,6 +865,31 @@ export default function AppIndex() {
     if (!d || !d.ok || d.op !== "simulate") return;
     setSimulationByOrder((prev) => ({ ...prev, [d.orderGid]: d }));
   }, [simulateFetcher.data]);
+
+  useEffect(() => {
+    setQueueRows(data.queueRows);
+  }, [data.queueRows]);
+
+  useEffect(() => {
+    const d = manualFetcher.data;
+    if (!d || !d.ok || d.op !== "manualDecision") return;
+    setQueueRows((prev) => {
+      if (d.decision === "ALLOW") {
+        return prev.filter((row) => row.orderGid !== d.orderGid);
+      }
+      return prev.map((row) =>
+        row.orderGid === d.orderGid
+          ? {
+              ...row,
+              manualDecision: d.decision,
+              manualDecisionBy: d.decidedBy,
+              manualDecisionAt: d.decidedAt,
+              decision: "HOLD",
+            }
+          : row
+      );
+    });
+  }, [manualFetcher.data]);
 
   const setLevel = (lvl: string) => {
     const p = new URLSearchParams(params);
@@ -846,9 +944,11 @@ export default function AppIndex() {
       {tab === "queue" ? (
         <QueueTab
           data={data}
+          rows={queueRows}
           lang={lang}
           openQueueReasonId={openQueueReasonId}
           setOpenQueueReasonId={setOpenQueueReasonId}
+          manualFetcher={manualFetcher}
         />
       ) : tab === "orders" ? (
         <>
@@ -913,10 +1013,23 @@ export default function AppIndex() {
                           <div style={{ marginTop: 2, fontSize: 12, color: "#6d7175" }}>
                             {t(lang, "decision")}:{" "}
                             <DecisionDisplay
-                              decision={r.lastDecision}
-                              skipReason={r.skipReason}
+                              decision={r.manualDecision ?? r.lastDecision}
+                              skipReason={r.manualDecision ? null : r.skipReason}
                               lang={lang}
                             />
+                            {r.manualDecision ? (
+                              <div style={{ marginTop: 6, fontSize: 12, color: "#6d7175" }}>
+                                {t(lang, "manualDecisionLabel")}: {decisionLabel(lang, r.manualDecision)}
+                                {r.manualDecisionBy && r.manualDecisionAt ? (
+                                  <div>
+                                    {t(lang, "manualDecisionByAt", {
+                                      by: r.manualDecisionBy,
+                                      date: formatDate(r.manualDecisionAt),
+                                    })}
+                                  </div>
+                                ) : null}
+                              </div>
+                            ) : null}
                           </div>
                           <div style={{ marginTop: 6 }}>
                             <simulateFetcher.Form method="post" action="?index" style={{ display: "inline-block" }}>
@@ -1112,16 +1225,20 @@ export default function AppIndex() {
 
 function QueueTab({
   data,
+  rows,
   lang,
   openQueueReasonId,
   setOpenQueueReasonId,
+  manualFetcher,
 }: {
   data: LoaderData;
+  rows: QueueRow[];
   lang: Lang;
   openQueueReasonId: string | null;
   setOpenQueueReasonId: (next: string | null) => void;
+  manualFetcher: ReturnType<typeof useFetcher<ActionData>>;
 }) {
-  if (data.queueRows.length === 0) {
+  if (rows.length === 0) {
     if (!data.hasActiveRules || !data.hasEnabledActiveRules) {
       return (
         <section style={card}>
@@ -1161,11 +1278,12 @@ function QueueTab({
               <th style={th}>{t(lang, "queueDecision")}</th>
               <th style={th}>{t(lang, "queueRisk")}</th>
               <th style={th}>{t(lang, "queueWhy")}</th>
+              <th style={th}>{t(lang, "queueActions")}</th>
               <th style={th}>{t(lang, "thLink")}</th>
             </tr>
           </thead>
           <tbody>
-            {data.queueRows.map((row) => (
+            {rows.map((row) => (
               <tr key={row.id}>
                 <td style={td}>{formatDate(row.lastEventAt ?? row.updatedAt)}</td>
                 <td style={tdStrong}>
@@ -1181,6 +1299,19 @@ function QueueTab({
                       {row.decision === "HOLD" ? t(lang, "priorityHigh") : t(lang, "priorityMedium")}
                     </span>
                   </div>
+                  {row.manualDecision ? (
+                    <div style={{ marginTop: 4, fontSize: 12, color: "#6d7175" }}>
+                      {t(lang, "manualDecisionLabel")}: {decisionLabel(lang, row.manualDecision)}
+                      {row.manualDecisionBy && row.manualDecisionAt ? (
+                        <div>
+                          {t(lang, "manualDecisionByAt", {
+                            by: row.manualDecisionBy,
+                            date: formatDate(row.manualDecisionAt),
+                          })}
+                        </div>
+                      ) : null}
+                    </div>
+                  ) : null}
                 </td>
                 <td style={td}>
                   <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
@@ -1217,6 +1348,34 @@ function QueueTab({
                       ) : null}
                     </div>
                   ) : null}
+                </td>
+                <td style={td}>
+                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                    <manualFetcher.Form method="post" action="?index" style={{ display: "inline-block" }}>
+                      <input type="hidden" name="_action" value="manualDecision" />
+                      <input type="hidden" name="orderGid" value={row.orderGid} />
+                      <input type="hidden" name="decision" value="ALLOW" />
+                      <button
+                        type="submit"
+                        style={secondaryBtn}
+                        disabled={manualFetcher.state !== "idle" || row.manualDecision === "ALLOW"}
+                      >
+                        {t(lang, "markSafe")}
+                      </button>
+                    </manualFetcher.Form>
+                    <manualFetcher.Form method="post" action="?index" style={{ display: "inline-block" }}>
+                      <input type="hidden" name="_action" value="manualDecision" />
+                      <input type="hidden" name="orderGid" value={row.orderGid} />
+                      <input type="hidden" name="decision" value="HOLD" />
+                      <button
+                        type="submit"
+                        style={secondaryBtn}
+                        disabled={manualFetcher.state !== "idle" || row.manualDecision === "HOLD"}
+                      >
+                        {t(lang, "keepOnHold")}
+                      </button>
+                    </manualFetcher.Form>
+                  </div>
                 </td>
                 <td style={td}>
                   {row.orderAdminUrl ? (
