@@ -12,10 +12,16 @@ import { decisionFromRiskLevel } from "../riskmate/decision";
 
 import crypto from "crypto";
 import prisma from "../db.server";
+import { updateBillingState } from "../riskmate/billing.server";
 
 // ---------------- helpers ----------------
 
-const ALLOWED_TOPICS = new Set(["orders/create", "orders/updated", "orders/paid"]);
+const ALLOWED_TOPICS = new Set([
+  "orders/create",
+  "orders/updated",
+  "orders/paid",
+  "app_subscriptions/cancelled",
+]);
 
 function normalizeTopic(topic: unknown) {
   const t = String(topic ?? "").toLowerCase().trim();
@@ -224,6 +230,36 @@ export async function action({ request }: ActionFunctionArgs) {
 
     // only create/update for now (paid can stay in allow-list but we won't map it to source)
     if (!ALLOWED_TOPICS.has(t)) return new Response("OK");
+
+    if (t === "app_subscriptions/cancelled") {
+      const subscriptionId =
+        (payload as any)?.app_subscription?.id ??
+        (payload as any)?.app_subscription?.admin_graphql_api_id ??
+        (payload as any)?.id ??
+        null;
+
+      if (!subscriptionId) {
+        console.warn("[RiskMate] subscription cancel without id", { shop, topic: t });
+        return new Response("OK");
+      }
+
+      const existing = await prisma.billingState.findFirst({
+        where: { subscriptionId },
+        select: { shop: true },
+      });
+
+      if (existing?.shop) {
+        await updateBillingState({
+          shop: existing.shop,
+          status: "CANCELLED",
+          reason: "SUBSCRIPTION_CANCELLED",
+          subscriptionId,
+        });
+      }
+
+      console.log("[RiskMate] subscription cancelled", { shop, subscriptionId });
+      return new Response("OK");
+    }
 
     orderGid = ((payload as any)?.admin_graphql_api_id as string | undefined) ?? null;
     const orderName = (payload as any)?.name as string | undefined;
