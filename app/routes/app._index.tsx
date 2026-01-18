@@ -7,6 +7,7 @@ import { authenticate } from "../shopify.server";
 import { SUPPORTED_LANGS, type Lang, t, parseLang } from "../i18n/strings";
 import { computeRulesVersion } from "../riskmate/rulesetVersion.server";
 import { computeRiskFromSnapshot } from "../riskmate/riskEngine.server";
+import { getBillingAccess, type BillingAccess } from "../riskmate/billing.server";
 
 type LoaderData = Awaited<ReturnType<typeof loader>>;
 
@@ -169,6 +170,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
   const url = new URL(request.url);
 
   const lang = parseLang(url.searchParams.get("lang"));
+  const billingAccess = await getBillingAccess(session.shop);
 
   const shopRes = await admin.graphql(`
     query { shop { currencyCode } }
@@ -447,6 +449,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
     tab,
     level,
     lang,
+    billingAccess,
     hasRules,
     hasChecks,
     hasActiveRules: activeRules.length > 0,
@@ -625,6 +628,7 @@ export async function action({ request }: ActionFunctionArgs) {
   const lang = parseLang(url.searchParams.get("lang"));
   const form = await request.formData();
   const intent = String(form.get("_action") ?? "");
+  const billingAccess = await getBillingAccess(session.shop);
 
   if (intent === "simulate") {
     const orderGid = String(form.get("orderGid") ?? "").trim();
@@ -716,6 +720,9 @@ export async function action({ request }: ActionFunctionArgs) {
   }
 
   if (intent === "manualDecision") {
+    if (billingAccess.needsUpgrade) {
+      return json<ActionData>({ ok: false, error: t(lang, "billingUpgradeRequired") }, 403);
+    }
     const orderGid = String(form.get("orderGid") ?? "").trim();
     const decision = String(form.get("decision") ?? "").trim().toUpperCase();
     if (!orderGid) {
@@ -757,6 +764,9 @@ export async function action({ request }: ActionFunctionArgs) {
   }
 
   if (intent === "addNote") {
+    if (billingAccess.needsUpgrade) {
+      return json<ActionData>({ ok: false, error: t(lang, "billingUpgradeRequired") }, 403);
+    }
     const orderGid = String(form.get("orderGid") ?? "").trim();
     const body = String(form.get("body") ?? "").trim();
     if (!orderGid) {
@@ -1189,13 +1199,14 @@ export default function AppIndex() {
       </div>
 
       {tab === "health" ? (
-        <HealthTab data={data} lang={lang} />
+        <HealthTab data={data} lang={lang} billingAccess={data.billingAccess} />
       ) : tab === "queue" ? (
         <QueueTab
           data={data}
           rows={queueRows}
           notesByOrder={notesByOrder}
           lang={lang}
+          billingAccess={data.billingAccess}
           openQueueReasonId={openQueueReasonId}
           setOpenQueueReasonId={setOpenQueueReasonId}
           openNotesId={openNotesId}
@@ -1288,6 +1299,7 @@ export default function AppIndex() {
                                 orderGid={r.orderGid}
                                 notes={notesByOrder[r.orderGid] ?? []}
                                 lang={lang}
+                                canAddNote={!data.billingAccess.needsUpgrade}
                                 openNotesId={openNotesId}
                                 setOpenNotesId={setOpenNotesId}
                                 noteFetcher={noteFetcher}
@@ -1491,6 +1503,7 @@ function QueueTab({
   rows,
   notesByOrder,
   lang,
+  billingAccess,
   openQueueReasonId,
   setOpenQueueReasonId,
   openNotesId,
@@ -1502,6 +1515,7 @@ function QueueTab({
   rows: QueueRow[];
   notesByOrder: Record<string, NoteItem[]>;
   lang: Lang;
+  billingAccess: BillingAccess;
   openQueueReasonId: string | null;
   setOpenQueueReasonId: (next: string | null) => void;
   openNotesId: string | null;
@@ -1537,6 +1551,18 @@ function QueueTab({
           <div style={subtle}>{t(lang, "queueSubtitle")}</div>
         </div>
       </div>
+
+      {billingAccess.needsUpgrade ? (
+        <div style={billingBanner}>
+          <div>
+            <div style={{ fontWeight: 700 }}>{t(lang, "billingUpgradeTitle")}</div>
+            <div style={{ color: "#6d7175", fontSize: 12 }}>{t(lang, "billingUpgradeBody")}</div>
+          </div>
+          <a href="/billing/upgrade" style={primaryBtn}>
+            {t(lang, "billingUpgradeCta")}
+          </a>
+        </div>
+      ) : null}
 
       <div style={divider} />
 
@@ -1626,6 +1652,7 @@ function QueueTab({
                       orderGid={row.orderGid}
                       notes={notes}
                       lang={lang}
+                      canAddNote={!billingAccess.needsUpgrade}
                       openNotesId={openNotesId}
                       setOpenNotesId={setOpenNotesId}
                       noteFetcher={noteFetcher}
@@ -1641,7 +1668,11 @@ function QueueTab({
                       <button
                         type="submit"
                         style={secondaryBtn}
-                        disabled={manualFetcher.state !== "idle" || row.manualDecision === "ALLOW"}
+                        disabled={
+                          billingAccess.needsUpgrade ||
+                          manualFetcher.state !== "idle" ||
+                          row.manualDecision === "ALLOW"
+                        }
                       >
                         {t(lang, "markSafe")}
                       </button>
@@ -1653,7 +1684,11 @@ function QueueTab({
                       <button
                         type="submit"
                         style={secondaryBtn}
-                        disabled={manualFetcher.state !== "idle" || row.manualDecision === "HOLD"}
+                        disabled={
+                          billingAccess.needsUpgrade ||
+                          manualFetcher.state !== "idle" ||
+                          row.manualDecision === "HOLD"
+                        }
                       >
                         {t(lang, "keepOnHold")}
                       </button>
@@ -1680,7 +1715,15 @@ function QueueTab({
 
 /* ---------- Health tab ---------- */
 
-function HealthTab({ data, lang }: { data: LoaderData; lang: Lang }) {
+function HealthTab({
+  data,
+  lang,
+  billingAccess,
+}: {
+  data: LoaderData;
+  lang: Lang;
+  billingAccess: BillingAccess;
+}) {
   const health = data.health;
 
   if (!health.hasAnyEvents) {
@@ -1738,6 +1781,14 @@ function HealthTab({ data, lang }: { data: LoaderData; lang: Lang }) {
             <div style={healthCallout}>
               <div>{t(lang, "healthSelfHealing")}</div>
               <div>{t(lang, "healthNoAction")}</div>
+            </div>
+          ) : null}
+          {billingAccess.needsUpgrade ? (
+            <div style={healthWarning}>
+              <div>{t(lang, "billingReadOnlyHealth")}</div>
+              <a href="/billing/upgrade" style={link}>
+                {t(lang, "billingUpgradeCta")}
+              </a>
             </div>
           ) : null}
           {health.staleWebhook || health.staleRiskEvent ? (
@@ -1869,6 +1920,7 @@ function NotesPopover({
   orderGid,
   notes,
   lang,
+  canAddNote,
   openNotesId,
   setOpenNotesId,
   noteFetcher,
@@ -1876,6 +1928,7 @@ function NotesPopover({
   orderGid: string;
   notes: NoteItem[];
   lang: Lang;
+  canAddNote: boolean;
   openNotesId: string | null;
   setOpenNotesId: (next: string | null) => void;
   noteFetcher: ReturnType<typeof useFetcher<ActionData>>;
@@ -1915,19 +1968,23 @@ function NotesPopover({
             <div style={{ fontSize: 12, color: "#6d7175" }}>{t(lang, "notesEmpty")}</div>
           )}
           <div style={{ marginTop: 8 }}>
-            <noteFetcher.Form method="post" action="?index" style={{ display: "grid", gap: 6 }}>
-              <input type="hidden" name="_action" value="addNote" />
-              <input type="hidden" name="orderGid" value={orderGid} />
-              <textarea
-                name="body"
-                placeholder={t(lang, "notePlaceholder")}
-                style={noteTextarea}
-                rows={2}
-              />
-              <button type="submit" style={secondaryBtn} disabled={noteFetcher.state !== "idle"}>
-                {t(lang, "addNote")}
-              </button>
-            </noteFetcher.Form>
+            {canAddNote ? (
+              <noteFetcher.Form method="post" action="?index" style={{ display: "grid", gap: 6 }}>
+                <input type="hidden" name="_action" value="addNote" />
+                <input type="hidden" name="orderGid" value={orderGid} />
+                <textarea
+                  name="body"
+                  placeholder={t(lang, "notePlaceholder")}
+                  style={noteTextarea}
+                  rows={2}
+                />
+                <button type="submit" style={secondaryBtn} disabled={noteFetcher.state !== "idle"}>
+                  {t(lang, "addNote")}
+                </button>
+              </noteFetcher.Form>
+            ) : (
+              <div style={{ fontSize: 12, color: "#6d7175" }}>{t(lang, "billingReadOnlyNotes")}</div>
+            )}
           </div>
         </div>
       ) : null}
@@ -3572,6 +3629,18 @@ const healthWarning: React.CSSProperties = {
   color: "#7a4a00",
   display: "grid",
   gap: 4,
+};
+
+const billingBanner: React.CSSProperties = {
+  marginTop: 12,
+  padding: "10px 12px",
+  borderRadius: 12,
+  border: "1px solid #eadab8",
+  background: "#fff9ef",
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "space-between",
+  gap: 12,
 };
 
 const healthTrustList: React.CSSProperties = {

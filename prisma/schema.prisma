@@ -72,6 +72,38 @@ model RiskResult {
   @@index([shop, lastRiskChangeAt])
 }
 
+model BillingState {
+  id String @id @default(cuid())
+  shop String @unique
+  status BillingStatus
+  trialEndsAt DateTime?
+  subscriptionId String?
+  currentPeriodEnd DateTime?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @default(now()) @updatedAt
+}
+
+model BillingTransition {
+  id String @id @default(cuid())
+  shop String
+  fromStatus BillingStatus?
+  toStatus BillingStatus
+  reason String
+  subscriptionId String?
+  trialEndsAt DateTime?
+  currentPeriodEnd DateTime?
+  changedAt DateTime @default(now())
+
+  @@index([shop, changedAt])
+}
+
+enum BillingStatus {
+  TRIAL
+  ACTIVE
+  EXPIRED
+  CANCELLED
+}
+
 model RiskNote {
   id String @id @default(cuid())
   shop String
